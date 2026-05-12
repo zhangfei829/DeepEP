@@ -48,8 +48,12 @@ err()  { printf '\033[1;31m[jh:%s:ERR]\033[0m %s\n' "$STAGE" "$*" >&2; }
 : "${JH_SSH_KEY:=$HOME/id_ed25519}"
 [ -f "$JH_SSH_KEY" ] || { STAGE=pre err "jumphost ssh key not found: $JH_SSH_KEY"; exit 1; }
 
-# Common ssh wrapper (use -n to avoid swallowing stdin in for-ssh-done loops)
-JSSH=(ssh -n -i "$JH_SSH_KEY" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
+# Common ssh wrapper.
+# JSSH:    no `-n`; safe for `bash <<HEREDOC` style invocations.
+# JSSH_N:  with `-n`; use this inside `for t in $TRAYS; do ssh ... done` loops
+#          so stdin isn't consumed by the for-loop iterator.
+JSSH=(ssh   -i "$JH_SSH_KEY" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
+JSSH_N=(ssh -n -i "$JH_SSH_KEY" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
 
 # Sanity: HEAD_TRAY must be in TRAYS
 case " $TRAYS " in *" $HEAD_TRAY "*) ;; *) STAGE=pre err "HEAD_TRAY=$HEAD_TRAY not in TRAYS=$TRAYS"; exit 1;; esac
@@ -87,18 +91,19 @@ if [ "$SKIP_SSH_SETUP" = "1" ]; then
 else
   for t in $TRAYS; do
     log "installing head pubkey on $t"
-    "${JSSH[@]}" "fizhang@$t" bash -l <<'REMOTE'
+    # one-liner avoids needing stdin for a heredoc inside the for-loop
+    "${JSSH_N[@]}" "fizhang@$t" '
 set -euo pipefail
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
 grep -qxFf /home/fizhang/head_tray_pub.txt ~/.ssh/authorized_keys \
   || cat /home/fizhang/head_tray_pub.txt >> ~/.ssh/authorized_keys
-REMOTE
+'
   done
 
   log "verifying head_tray -> each tray ssh works (head_tray to spawn mpirun)"
   for t in $TRAYS; do
-    if ! "${JSSH[@]}" "fizhang@$HEAD_TRAY" "ssh -n -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o BatchMode=yes $t 'hostname'" 2>/dev/null; then
+    if ! "${JSSH_N[@]}" "fizhang@$HEAD_TRAY" "ssh -n -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o BatchMode=yes $t 'hostname'" 2>/dev/null; then
       err "ssh from $HEAD_TRAY to $t failed"
       exit 1
     fi
