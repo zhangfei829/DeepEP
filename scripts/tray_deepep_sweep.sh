@@ -43,6 +43,16 @@ err()  { printf '\033[1;31m[sweep:ERR]\033[0m %s\n' "$*" >&2; }
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${EXTRA_ARGS:=}"
 
+# Resolve python interpreter (some trays only have python3, not python).
+: "${PYTHON_BIN:=}"
+if [ -z "$PYTHON_BIN" ]; then
+  for cand in python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then PYTHON_BIN="$cand"; break; fi
+  done
+fi
+[ -n "$PYTHON_BIN" ] || { err "no python interpreter found (tried python3, python). Set PYTHON_BIN=/path/to/python"; exit 1; }
+export PYTHON_BIN
+
 # Slots per node, derived from TRAYS line one (use slots=N if hostfile already set)
 : "${SLOTS_PER_NODE:=4}"
 
@@ -146,7 +156,7 @@ run_one() {
     -x MASTER_ADDR="$MASTER_ADDR" -x MASTER_PORT="$MASTER_PORT" \
     -x DEEPEP_LOG_DIR="$DEEPEP_LOG_DIR" -x DEEPEP_RUN_TAG="$tag" \
     -x DEEPEP_DIR="$DEEPEP_DIR" \
-    python -u "$DEEPEP_DIR/scripts/mpi_launch_ep.py" "${args[@]}"
+    "$PYTHON_BIN" -u "$DEEPEP_DIR/scripts/mpi_launch_ep.py" "${args[@]}"
   local rc=$?
   set -e
   if (( rc != 0 )); then
@@ -173,4 +183,4 @@ done
 
 log "sweep complete. logs:  $DEEPEP_LOG_DIR/$SWEEP_TAG.*.log"
 log "index file:           $INDEX_FILE"
-log "next:  python $DEEPEP_DIR/scripts/parse_deepep_csv.py --log-dir $DEEPEP_LOG_DIR --tag $SWEEP_TAG"
+log "next:  $PYTHON_BIN $DEEPEP_DIR/scripts/parse_deepep_csv.py --log-dir $DEEPEP_LOG_DIR --tag $SWEEP_TAG"

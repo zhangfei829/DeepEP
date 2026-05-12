@@ -200,8 +200,13 @@ if [ ! -f "$PARSE_SCRIPT" ]; then
   PARSE_SCRIPT="$JH_LOG_DIR/parse_deepep_csv.py"
 fi
 
-if [ -f "$PARSE_SCRIPT" ]; then
-  python3 "$PARSE_SCRIPT" --log-dir "$JH_LOG_DIR" --tag "$SWEEP_TAG" \
+JH_PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1; then JH_PY="$cand"; break; fi
+done
+
+if [ -f "$PARSE_SCRIPT" ] && [ -n "$JH_PY" ]; then
+  "$JH_PY" "$PARSE_SCRIPT" --log-dir "$JH_LOG_DIR" --tag "$SWEEP_TAG" \
     | tee "$JH_LOG_DIR/$SWEEP_TAG.summary.md"
   log "summary csv:  $JH_LOG_DIR/$SWEEP_TAG.summary.csv"
   log "summary md:   $JH_LOG_DIR/$SWEEP_TAG.summary.md"

@@ -38,6 +38,16 @@ err() { printf '\033[1;31m[build:ERR]\033[0m %s\n' "$*" >&2; }
 [ -d "$DEEPEP_DIR" ]   || { err "DEEPEP_DIR not found: $DEEPEP_DIR";   exit 1; }
 [ -d "$CUDA_HOME" ]    || { err "CUDA_HOME not found:  $CUDA_HOME";    exit 1; }
 [ -d "$MPI_HOME" ]     || { err "MPI_HOME not found:   $MPI_HOME";     exit 1; }
+
+# Resolve a python interpreter. Some trays only have `python3`, not `python`.
+: "${PYTHON_BIN:=}"
+if [ -z "$PYTHON_BIN" ]; then
+  for cand in python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then PYTHON_BIN="$cand"; break; fi
+  done
+fi
+[ -n "$PYTHON_BIN" ] || { err "no python interpreter found (tried python3, python). Set PYTHON_BIN=/path/to/python"; exit 1; }
+export PYTHON_BIN
 if [ "$SKIP_NCCL_CHECK" != "1" ]; then
   [ -f "$NCCL_ROOT_DIR/lib/libnccl.so" ]    || { err "missing $NCCL_ROOT_DIR/lib/libnccl.so   - did you run 'make src.build' on NCCL?"; exit 1; }
   [ -f "$NCCL_ROOT_DIR/include/nccl.h" ]    || { err "missing $NCCL_ROOT_DIR/include/nccl.h"; exit 1; }
@@ -50,6 +60,7 @@ log "CUDA_HOME      = $CUDA_HOME"
 log "DEEPEP_ARCH    = $DEEPEP_ARCH"
 log "BUILD_JOBS     = $DEEPEP_BUILD_JOBS  (use >=4 only if you've verified cicc isn't stuck on GB300)"
 log "DISABLE_LEGACY = $DISABLE_LEGACY  (1 = V2-only build, no NVSHMEM)"
+log "PYTHON_BIN     = $PYTHON_BIN"
 
 # ----- compile env -----------------------------------------------------------
 export PATH="$MPI_HOME/bin:$CUDA_HOME/bin:${PATH:-}"
@@ -89,7 +100,7 @@ probe_nvshmem() {
   done
   # pip wheel path (nvidia-nvshmem-cu13 / cu12)
   local py_lib
-  py_lib=$(python - <<'PY' 2>/dev/null || true
+  py_lib=$("$PYTHON_BIN" - <<'PY' 2>/dev/null || true
 import os
 from importlib.metadata import distributions
 for d in distributions():
@@ -129,8 +140,8 @@ fi
 log "--- toolchain ---"
 which nvcc      && nvcc --version | head -n4 || true
 which mpicc     && mpicc --version | head -n1 || true
-which python    && python -V                  || true
-python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" || true
+which "$PYTHON_BIN" && "$PYTHON_BIN" -V       || true
+"$PYTHON_BIN" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" || true
 
 # ----- build -----------------------------------------------------------------
 cd "$DEEPEP_DIR"
@@ -139,7 +150,7 @@ log "cleaning previous build/"
 rm -rf build dist deep_ep/*.so deep_ep.egg-info
 
 log "running setup.py build (this can take a while)"
-python setup.py build 2>&1 | tail -n 40
+"$PYTHON_BIN" setup.py build 2>&1 | tail -n 40
 
 # in-place .so symlink so `python tests/elastic/test_ep.py` finds the module
 so_file=$(find build -maxdepth 3 -name 'deep_ep*.so' -type f | head -n 1)
@@ -152,7 +163,7 @@ log "linked $so_file -> deep_ep/$(basename "$so_file")"
 
 # ----- smoke: import + NCCL version -----------------------------------------
 log "smoke: import deep_ep (this also triggers NCCL/library probes)"
-EP_BUFFER_DEBUG=1 python - <<'PY'
+EP_BUFFER_DEBUG=1 "$PYTHON_BIN" - <<'PY'
 import os, deep_ep
 print('OK: deep_ep version', deep_ep.__version__)
 print('   ElasticBuffer :', deep_ep.ElasticBuffer)
