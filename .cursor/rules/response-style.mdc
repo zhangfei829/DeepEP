@@ -1,0 +1,30 @@
+---
+description: Response style for DeepEP perf work — concise output, one-liners only
+alwaysApply: true
+---
+
+# Response style
+
+When the user asks for a command, give exactly **one copy-pasteable one-liner** (or the minimal block needed).
+
+- No "two ways to do it", no "方案 A/方案 B", no "首次 vs 日常".
+- No troubleshooting table, no "可选优化", no "下一步建议" — wait until asked.
+- No restating what just happened. No summaries of files written unless asked.
+- Code references / diffs only when the user explicitly asks for them.
+- Default to Chinese (per user rule), but keep prose short.
+
+If multiple variants genuinely exist, ask which one with `AskQuestion` instead
+of dumping them all.
+
+# Standing authorizations
+
+The user has pre-authorized the following without asking each time:
+
+- `git add` / `git commit` / `git push` to `origin/main` in this repo
+- creating / modifying files under `scripts/`, `.cursor/rules/`, and patch
+  edits to `setup.py`, `csrc/`, `deep_ep/`
+- running long shell commands (build, sweep) in foreground or background
+- pushing this work to `https://github.com/zhangfei829/DeepEP.git`
+
+Do **not** ask for confirmation before doing any of the above. Just do it and
+report the result in one line.

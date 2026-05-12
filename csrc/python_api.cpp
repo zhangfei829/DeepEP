@@ -5,7 +5,9 @@
 
 #include "jit/api.hpp"
 #include "elastic/buffer.hpp"
+#ifndef DISABLE_LEGACY
 #include "legacy/buffer.hpp"
+#endif
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -31,8 +33,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // JIT API
     deep_ep::jit::register_apis(m);
 
-    // Register legacy buffer APIs
+#ifndef DISABLE_LEGACY
+    // Register legacy buffer APIs (NVSHMEM-backed V1 path)
     deep_ep::legacy::register_apis(m);
+#endif
 
     // Register elastic buffer (DeepEP V2) APIs
     deep_ep::elastic::register_apis(m);

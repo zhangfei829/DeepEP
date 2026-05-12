@@ -85,13 +85,25 @@ init_jit()
 
 
 # Import APIs after initialization
-from .buffers.legacy import Buffer
+# Legacy V1 (`Buffer` + `Config`) is optional: when the extension was built with
+# `DISABLE_LEGACY=1`, neither the C++ class registrations nor the Python wrapper
+# are present, and we silently drop them. V2 (`ElasticBuffer`) does not depend
+# on either.
+try:
+    from .buffers.legacy import Buffer
+except ImportError:
+    Buffer = None  # type: ignore
 from .buffers.elastic import ElasticBuffer, EPHandle
 # noinspection PyUnresolvedReferences
 from .utils.event import EventOverlap, EventHandle
 from .utils.envs import get_physical_domain_size, get_logical_domain_size
 
 # noinspection PyUnresolvedReferences
-from deep_ep._C import Config, topk_idx_t
+from deep_ep._C import topk_idx_t
+try:
+    # noinspection PyUnresolvedReferences
+    from deep_ep._C import Config
+except ImportError:
+    Config = None  # type: ignore
 
 __version__ = '2.0.0'

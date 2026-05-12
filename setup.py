@@ -69,14 +69,21 @@ class CustomBuildPy(build_py):
 
 
 if __name__ == '__main__':
-    # TODO: make NVSHMEM and legacy optional
-    nvshmem_root_dir = find_pkgs.find_nvshmem_root()
+    # `DISABLE_LEGACY=1` strips the V1 buffer (NVSHMEM-backed) entirely:
+    # legacy/intranode/internode/internode_ll/layout sources are not compiled,
+    # NVSHMEM headers/libs are not linked, and `legacy::register_apis` is not
+    # registered at PYBIND11 init time. Use this when you only need V2's
+    # `ElasticBuffer` (e.g. GB300/sm_103 builds, faster compile, no NVSHMEM
+    # runtime dependency).
+    disable_legacy = int(os.getenv('DISABLE_LEGACY', 0))
+
     nccl_root_dir = find_pkgs.find_nccl_root()
+    nvshmem_root_dir = None if disable_legacy else find_pkgs.find_nvshmem_root()
 
     # `128,2417` is used to suppress warnings of `fmt`
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
-    sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
+    sources = ['csrc/python_api.cpp']
     include_dirs = [f'{current_dir}/deep_ep/include',
                     f'{current_dir}/third-party/fmt/include',
                     '/usr/local/cuda/include/cccl']
@@ -84,12 +91,22 @@ if __name__ == '__main__':
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
 
-    # NVSHMEM flags
-    sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
-    include_dirs.extend([f'{nvshmem_root_dir}/include'])
-    library_dirs.extend([f'{nvshmem_root_dir}/lib'])
-    nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
-    extra_link_args.extend([f'-l:libnvshmem_host.so', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
+    if disable_legacy:
+        # No NVSHMEM, no V1 sources. The `-DDISABLE_LEGACY` flag drops
+        # `legacy::register_apis` from `python_api.cpp` and skips the
+        # legacy include chain entirely.
+        cxx_flags.append('-DDISABLE_LEGACY')
+        nvcc_flags.append('-DDISABLE_LEGACY')
+    else:
+        # Legacy V1 (intranode + NVSHMEM internode) sources
+        sources.extend(['csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu'])
+
+        # NVSHMEM flags
+        sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
+        include_dirs.extend([f'{nvshmem_root_dir}/include'])
+        library_dirs.extend([f'{nvshmem_root_dir}/lib'])
+        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
+        extra_link_args.extend([f'-l:libnvshmem_host.so', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
 
     # NCCL flags
     sources.extend(['csrc/kernels/backend/nccl.cu'])
@@ -154,7 +171,7 @@ if __name__ == '__main__':
     print(f' > Compilation flags: {extra_compile_args}')
     print(f' > Link flags: {extra_link_args}')
     print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
-    print(f' > NVSHMEM path: {nvshmem_root_dir}')
+    print(f' > NVSHMEM path: {nvshmem_root_dir if nvshmem_root_dir else "(disabled via DISABLE_LEGACY=1)"}')
     print(f' > NCCL path: {nccl_root_dir}')
     # Print persistent env variables
     persistent_envs = []
