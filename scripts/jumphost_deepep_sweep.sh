@@ -129,9 +129,21 @@ if [ ! -d "$DEEPEP_DIR/.git" ]; then
   git clone "$GIT_REMOTE" "$DEEPEP_DIR"
 fi
 cd "$DEEPEP_DIR"
-git fetch --all --tags
+# Make sure 'origin' points at the fork the user actually wants; otherwise
+# `git reset --hard origin/main` would silently sync to whatever upstream URL
+# was clone'd in the past (e.g. deepseek-ai/DeepEP), missing our scripts/.
+if [ -n "$GIT_REMOTE" ]; then
+  current_origin=$(git remote get-url origin 2>/dev/null || echo "")
+  if [ "$current_origin" != "$GIT_REMOTE" ]; then
+    echo "[3] origin URL '$current_origin' != GIT_REMOTE '$GIT_REMOTE'; updating"
+    git remote set-url origin "$GIT_REMOTE"
+  fi
+fi
+git fetch --all --tags --prune
 git reset --hard "$GIT_REF"
 echo "[3] HEAD = $(git rev-parse --short HEAD)  ($(git log -1 --pretty='%s'))"
+ls scripts/ 2>/dev/null | head -n 10
+[ -f scripts/tray_build_deepep.sh ] || { echo "[3] scripts/tray_build_deepep.sh missing after reset; ref/remote wrong?" >&2; exit 1; }
 REMOTE
 
   log "building DeepEP via tray_build_deepep.sh on $HEAD_TRAY"
