@@ -114,11 +114,40 @@ _collect_python_candidates() {
   printf '%s\n' "${out[@]}" | awk '!seen[$0]++'
 }
 
+# Try `import torch` directly on $1. If it fails, fall back to injecting
+# a sibling venv site-packages via PYTHONPATH (handles broken pyvenv.cfg
+# where the bare interpreter doesn't auto-pick venv site-packages).
+# On success: sets _CHECK_PY_PATH (PYTHONPATH addition, may be empty)
+# and _CHECK_PY_TVER (torch version string). Returns 0/1.
+_check_python() {
+  local py="$1"
+  _CHECK_PY_PATH=""
+  _CHECK_PY_TVER=""
+  local tver
+  tver=$("$py" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
+  if [ -n "$tver" ]; then
+    _CHECK_PY_TVER="$tver"; return 0
+  fi
+  local py_dir venv_root site
+  py_dir=$(dirname "$py")
+  venv_root=$(dirname "$py_dir")
+  for site in "$venv_root"/lib/python*/site-packages \
+              "$venv_root"/lib64/python*/site-packages \
+              "$venv_root"/lib/python*/dist-packages; do
+    [ -d "$site/torch" ] || continue
+    tver=$(PYTHONPATH="$site${PYTHONPATH:+:$PYTHONPATH}" "$py" \
+            -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
+    if [ -n "$tver" ]; then
+      _CHECK_PY_PATH="$site"; _CHECK_PY_TVER="$tver"; return 0
+    fi
+  done
+  return 1
+}
+
+# Probe all candidates. Mutates global PYTHON_BIN and (if needed) PYTHONPATH.
 _resolve_python() {
-  # All probing chatter goes to stderr; the chosen path is the only thing
-  # on stdout so the caller can `chosen=$(_resolve_python)`.
   echo "[build] probing python interpreters for torch..." >&2
-  local p chosen=""
+  local p chosen="" chosen_pp=""
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     if [ ! -x "$p" ]; then
@@ -126,21 +155,30 @@ _resolve_python() {
     fi
     local ver
     ver=$("$p" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo "?")
-    if _has_torch "$p"; then
-      local tver
-      tver=$("$p" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo "?")
-      printf '  + %-50s  python=%s torch=%s  <-- using\n' "$p" "$ver" "$tver" >&2
-      chosen="$p"; break
+    if _check_python "$p"; then
+      if [ -n "$_CHECK_PY_PATH" ]; then
+        printf '  + %-50s  python=%s torch=%s  <-- using (PYTHONPATH=%s)\n' \
+          "$p" "$ver" "$_CHECK_PY_TVER" "$_CHECK_PY_PATH" >&2
+      else
+        printf '  + %-50s  python=%s torch=%s  <-- using\n' \
+          "$p" "$ver" "$_CHECK_PY_TVER" >&2
+      fi
+      chosen="$p"; chosen_pp="$_CHECK_PY_PATH"; break
     else
       printf '  - %-50s  python=%s (no torch)\n' "$p" "$ver" >&2
     fi
   done < <(_collect_python_candidates)
   [ -n "$chosen" ] || return 1
-  printf '%s\n' "$chosen"
+  PYTHON_BIN="$chosen"
+  if [ -n "$chosen_pp" ]; then
+    export PYTHONPATH="$chosen_pp${PYTHONPATH:+:$PYTHONPATH}"
+    echo "[build] injected PYTHONPATH=$PYTHONPATH" >&2
+  fi
+  return 0
 }
 
-PYTHON_BIN=$(_resolve_python || true)
-if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "$PYTHON_BIN" ] || ! _has_torch "$PYTHON_BIN"; then
+if ! _resolve_python; then PYTHON_BIN=""; fi
+if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "$PYTHON_BIN" ] || ! "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
   err "no python interpreter with torch found anywhere."
   err "Common fixes:"
   err "  1) module load python ; module load pytorch       (if your cluster uses modulefiles)"
