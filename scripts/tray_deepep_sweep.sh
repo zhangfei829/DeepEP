@@ -43,37 +43,62 @@ err()  { printf '\033[1;31m[sweep:ERR]\033[0m %s\n' "$*" >&2; }
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${EXTRA_ARGS:=}"
 
-# Resolve a python interpreter that has `torch` importable.
-# Same probe logic as tray_build_deepep.sh -- kept inline for self-containment.
+# Resolve a python interpreter that has `torch` importable. Uses the same
+# probe as tray_build_deepep.sh; chatter goes to stderr, chosen path to stdout.
 _has_torch() { "$1" -c "import torch" >/dev/null 2>&1; }
-_resolve_python() {
+_collect_python_candidates() {
+  local out=()
+  [ -n "${PYTHON_BIN:-}" ] && out+=("$PYTHON_BIN")
   local p
-  if [ -n "${PYTHON_BIN:-}" ] && _has_torch "$PYTHON_BIN"; then echo "$PYTHON_BIN"; return 0; fi
-  for p in python3 python; do
-    if command -v "$p" >/dev/null 2>&1 && _has_torch "$p"; then command -v "$p"; return 0; fi
+  for p in python3 python python3.10 python3.11 python3.12 python3.13; do
+    p=$(command -v "$p" 2>/dev/null || true); [ -n "$p" ] && out+=("$p")
   done
   local conda_pys=(
-    "$HOME"/anaconda3/envs/*/bin/python
-    "$HOME"/miniconda3/envs/*/bin/python
-    "$HOME"/anaconda3/bin/python
-    "$HOME"/miniconda3/bin/python
-    /opt/conda/envs/*/bin/python
-    /opt/conda/bin/python
+    "$HOME"/anaconda3/envs/*/bin/python "$HOME"/miniconda3/envs/*/bin/python
+    "$HOME"/anaconda3/bin/python        "$HOME"/miniconda3/bin/python
+    /opt/conda/envs/*/bin/python        /opt/conda/bin/python
     /opt/miniconda*/bin/python
-    "$HOME"/.venv/bin/python
-    "$HOME"/venv/bin/python
+    "$HOME"/.venv/bin/python "$HOME"/venv/bin/python
+    "$HOME"/.local/bin/python* /usr/bin/python3.*
   )
-  for p in "${conda_pys[@]}"; do
-    [ -x "$p" ] || continue
-    if _has_torch "$p"; then echo "$p"; return 0; fi
+  for p in "${conda_pys[@]}"; do [ -x "$p" ] && out+=("$p"); done
+  local lib site_dir py_dir pyver
+  for lib in $(find "$HOME" /opt /usr/local /usr -maxdepth 8 -name 'libtorch.so' 2>/dev/null | head -20); do
+    site_dir=$(dirname "$lib")
+    site_dir=$(dirname "$(dirname "$site_dir")")
+    py_dir=$(dirname "$(dirname "$site_dir")")
+    pyver=$(basename "$(dirname "$site_dir")")
+    [ -x "$py_dir/bin/$pyver" ]     && out+=("$py_dir/bin/$pyver")
+    [ -x "$py_dir/bin/python3" ]    && out+=("$py_dir/bin/python3")
   done
-  for p in $(find "$HOME" /opt /usr/local -maxdepth 5 -name python3 -type f -executable 2>/dev/null); do
-    if _has_torch "$p"; then echo "$p"; return 0; fi
+  for p in $(find "$HOME" /opt /usr/local /usr -maxdepth 6 -name 'python3*' -type f -executable 2>/dev/null); do
+    out+=("$p")
   done
-  return 1
+  printf '%s\n' "${out[@]}" | awk '!seen[$0]++'
 }
-if PYTHON_BIN=$(_resolve_python); then export PYTHON_BIN
-else err "no python interpreter with torch found; set PYTHON_BIN or activate your conda/venv"; exit 1; fi
+_resolve_python() {
+  echo "[sweep] probing python interpreters for torch..." >&2
+  local p chosen=""
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -x "$p" ] || { printf '  - %-50s  (not executable)\n' "$p" >&2; continue; }
+    local ver
+    ver=$("$p" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo "?")
+    if _has_torch "$p"; then
+      printf '  + %-50s  python=%s  <-- using\n' "$p" "$ver" >&2
+      chosen="$p"; break
+    else
+      printf '  - %-50s  python=%s (no torch)\n' "$p" "$ver" >&2
+    fi
+  done < <(_collect_python_candidates)
+  [ -n "$chosen" ] || return 1
+  printf '%s\n' "$chosen"
+}
+PYTHON_BIN=$(_resolve_python || true)
+if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "$PYTHON_BIN" ] || ! _has_torch "$PYTHON_BIN"; then
+  err "no python interpreter with torch found; set PYTHON_BIN or activate your conda/venv"; exit 1
+fi
+export PYTHON_BIN
 log "PYTHON_BIN     = $PYTHON_BIN"
 
 # Slots per node, derived from TRAYS line one (use slots=N if hostfile already set)

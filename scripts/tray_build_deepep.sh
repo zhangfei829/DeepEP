@@ -41,26 +41,23 @@ err() { printf '\033[1;31m[build:ERR]\033[0m %s\n' "$*" >&2; }
 
 # Resolve a python interpreter that has `torch` importable. DeepEP setup.py
 # imports torch at top level, so a bare /usr/bin/python3 without torch is
-# useless. We try in order:
-#   1. $PYTHON_BIN if user already exported one
-#   2. each python under $PATH (python3 first, then python)
-#   3. anaconda/miniconda env pythons under common locations
-#   4. any `python3` we can find via `find`
-# and we keep only the first one that successfully `import torch`s.
-_has_torch() {
-  "$1" -c "import torch" >/dev/null 2>&1
-}
+# useless. We log every candidate we try so the user sees exactly which
+# pythons exist and why each one was rejected.
+_has_torch() { "$1" -c "import torch" >/dev/null 2>&1; }
 
-_resolve_python() {
+# Collect candidate paths. Order: $PYTHON_BIN -> PATH pythons -> conda/venv
+# -> pip --user site -> versioned /usr/bin/python3.X -> libtorch.so reverse
+# lookup -> shotgun find under common roots.
+_collect_python_candidates() {
+  local out=()
+  [ -n "${PYTHON_BIN:-}" ] && out+=("$PYTHON_BIN")
+
   local p
-  if [ -n "${PYTHON_BIN:-}" ] && _has_torch "$PYTHON_BIN"; then
-    echo "$PYTHON_BIN"; return 0
-  fi
-  for p in python3 python; do
-    if command -v "$p" >/dev/null 2>&1 && _has_torch "$p"; then
-      command -v "$p"; return 0
-    fi
+  for p in python3 python python3.10 python3.11 python3.12 python3.13; do
+    p=$(command -v "$p" 2>/dev/null || true)
+    [ -n "$p" ] && out+=("$p")
   done
+
   local conda_pys=(
     "$HOME"/anaconda3/envs/*/bin/python
     "$HOME"/miniconda3/envs/*/bin/python
@@ -71,25 +68,71 @@ _resolve_python() {
     /opt/miniconda*/bin/python
     "$HOME"/.venv/bin/python
     "$HOME"/venv/bin/python
+    "$HOME"/.local/bin/python*
+    /usr/bin/python3.*
   )
   for p in "${conda_pys[@]}"; do
-    [ -x "$p" ] || continue
-    if _has_torch "$p"; then echo "$p"; return 0; fi
+    [ -x "$p" ] && out+=("$p")
   done
-  for p in $(find "$HOME" /opt /usr/local -maxdepth 5 -name python3 -type f -executable 2>/dev/null); do
-    if _has_torch "$p"; then echo "$p"; return 0; fi
+
+  # Reverse-lookup from any libtorch.so on the filesystem.
+  local lib site_dir py_dir
+  for lib in $(find "$HOME" /opt /usr/local /usr -maxdepth 8 -name 'libtorch.so' 2>/dev/null | head -20); do
+    site_dir=$(dirname "$lib")                                # .../site-packages/torch/lib
+    site_dir=$(dirname "$(dirname "$site_dir")")              # .../site-packages
+    py_dir=$(dirname "$(dirname "$site_dir")")                # .../lib/pythonX.Y/  -> .../
+    local pyver
+    pyver=$(basename "$(dirname "$site_dir")")                # pythonX.Y
+    if [ -x "$py_dir/bin/$pyver" ];     then out+=("$py_dir/bin/$pyver"); fi
+    if [ -x "$py_dir/bin/python3" ];    then out+=("$py_dir/bin/python3"); fi
+    if [ -x "$py_dir/../bin/$pyver" ];  then out+=("$py_dir/../bin/$pyver"); fi
+    if [ -x "$py_dir/../bin/python3" ]; then out+=("$py_dir/../bin/python3"); fi
   done
-  return 1
+
+  # Shotgun: any python3 under common roots.
+  for p in $(find "$HOME" /opt /usr/local /usr -maxdepth 6 -name 'python3*' -type f -executable 2>/dev/null); do
+    out+=("$p")
+  done
+
+  printf '%s\n' "${out[@]}" | awk '!seen[$0]++'
 }
 
-if PYTHON_BIN=$(_resolve_python); then
-  export PYTHON_BIN
-else
-  err "no python interpreter with torch found. Tried PATH, ~/anaconda3, ~/miniconda3, /opt/conda, ~/.venv, etc."
-  err "Either set PYTHON_BIN=/path/to/python-with-torch and re-run,"
-  err "or activate your conda/venv before launching this script."
+_resolve_python() {
+  # All probing chatter goes to stderr; the chosen path is the only thing
+  # on stdout so the caller can `chosen=$(_resolve_python)`.
+  echo "[build] probing python interpreters for torch..." >&2
+  local p chosen=""
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ ! -x "$p" ]; then
+      printf '  - %-50s  (not executable)\n' "$p" >&2; continue
+    fi
+    local ver
+    ver=$("$p" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo "?")
+    if _has_torch "$p"; then
+      local tver
+      tver=$("$p" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo "?")
+      printf '  + %-50s  python=%s torch=%s  <-- using\n' "$p" "$ver" "$tver" >&2
+      chosen="$p"; break
+    else
+      printf '  - %-50s  python=%s (no torch)\n' "$p" "$ver" >&2
+    fi
+  done < <(_collect_python_candidates)
+  [ -n "$chosen" ] || return 1
+  printf '%s\n' "$chosen"
+}
+
+PYTHON_BIN=$(_resolve_python || true)
+if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "$PYTHON_BIN" ] || ! _has_torch "$PYTHON_BIN"; then
+  err "no python interpreter with torch found anywhere."
+  err "Common fixes:"
+  err "  1) module load python ; module load pytorch       (if your cluster uses modulefiles)"
+  err "  2) source /path/to/conda/bin/activate <envname>   (then re-run this script)"
+  err "  3) PYTHON_BIN=/abs/path/to/python-with-torch bash $0"
+  err "  4) pip install --user 'torch>=2.10'               (then re-run)"
   exit 1
 fi
+export PYTHON_BIN
 if [ "$SKIP_NCCL_CHECK" != "1" ]; then
   [ -f "$NCCL_ROOT_DIR/lib/libnccl.so" ]    || { err "missing $NCCL_ROOT_DIR/lib/libnccl.so   - did you run 'make src.build' on NCCL?"; exit 1; }
   [ -f "$NCCL_ROOT_DIR/include/nccl.h" ]    || { err "missing $NCCL_ROOT_DIR/include/nccl.h"; exit 1; }
