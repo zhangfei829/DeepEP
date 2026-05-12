@@ -154,6 +154,7 @@ REMOTE
   log "building DeepEP via tray_build_deepep.sh on $HEAD_TRAY"
   "${JSSH[@]}" "fizhang@$HEAD_TRAY" \
     DEEPEP_DIR="$DEEPEP_DIR" NCCL_ROOT_DIR="$NCCL_ROOT_DIR" \
+    PYTHON_BIN="${PYTHON_BIN:-}" DISABLE_LEGACY="${DISABLE_LEGACY:-1}" \
     bash -l "$DEEPEP_DIR/scripts/tray_build_deepep.sh" 2>&1 \
     | sed 's/^/    /'
 fi
@@ -170,6 +171,7 @@ SWEEP_TAG="deepep_sweep_$RUN_ID"
   DEEPEP_LOG_DIR="$DEEPEP_LOG_DIR" \
   TRAYS="$TRAYS" \
   SWEEP_TAG="$SWEEP_TAG" \
+  PYTHON_BIN="${PYTHON_BIN:-}" \
   EP_SIZES="${EP_SIZES:-4 8 16}" \
   TOKENS="${TOKENS:-1024 2048 4096 8192}" \
   TOPK_EXPERTS="${TOPK_EXPERTS:-8:256 6:256}" \

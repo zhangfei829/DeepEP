@@ -75,22 +75,39 @@ _collect_python_candidates() {
     [ -x "$p" ] && out+=("$p")
   done
 
-  # Reverse-lookup from any libtorch.so on the filesystem.
+  # Reverse-lookup from any libtorch.so on the filesystem. Include shared FS
+  # roots commonly used on HPC clusters (/SFS-*, /scratch, /shared, /work,
+  # /data). Exclude /mnt/local/enroot (those are container rootfs blobs that
+  # require `enroot start`, not directly runnable).
+  local search_roots=("$HOME" /opt /usr/local /usr /scratch /shared /work /data)
+  local sfs_root
+  for sfs_root in /SFS-* /SFS /sfs /sfs-*; do
+    [ -d "$sfs_root" ] && search_roots+=("$sfs_root")
+  done
   local lib site_dir py_dir
-  for lib in $(find "$HOME" /opt /usr/local /usr -maxdepth 8 -name 'libtorch.so' 2>/dev/null | head -20); do
+  for lib in $(find "${search_roots[@]}" -maxdepth 10 -name 'libtorch.so' 2>/dev/null \
+                | grep -v '/enroot/data/' | head -30); do
     site_dir=$(dirname "$lib")                                # .../site-packages/torch/lib
     site_dir=$(dirname "$(dirname "$site_dir")")              # .../site-packages
     py_dir=$(dirname "$(dirname "$site_dir")")                # .../lib/pythonX.Y/  -> .../
     local pyver
     pyver=$(basename "$(dirname "$site_dir")")                # pythonX.Y
-    if [ -x "$py_dir/bin/$pyver" ];     then out+=("$py_dir/bin/$pyver"); fi
-    if [ -x "$py_dir/bin/python3" ];    then out+=("$py_dir/bin/python3"); fi
-    if [ -x "$py_dir/../bin/$pyver" ];  then out+=("$py_dir/../bin/$pyver"); fi
-    if [ -x "$py_dir/../bin/python3" ]; then out+=("$py_dir/../bin/python3"); fi
+    [ -x "$py_dir/bin/$pyver" ]     && out+=("$py_dir/bin/$pyver")
+    [ -x "$py_dir/bin/python3" ]    && out+=("$py_dir/bin/python3")
+    [ -x "$py_dir/bin/python" ]     && out+=("$py_dir/bin/python")
+    # venv layout: site-packages may live under .../lib/pythonX.Y/site-packages
+    # with python in ../bin/, or under .../python3.X/site-packages with
+    # python in <venv_root>/bin/.
+    local venv_root
+    venv_root=$(dirname "$(dirname "$(dirname "$site_dir")")")  # ../../../
+    [ -x "$venv_root/bin/python" ]  && out+=("$venv_root/bin/python")
+    [ -x "$venv_root/bin/python3" ] && out+=("$venv_root/bin/python3")
+    [ -x "$venv_root/bin/$pyver" ]  && out+=("$venv_root/bin/$pyver")
   done
 
-  # Shotgun: any python3 under common roots.
-  for p in $(find "$HOME" /opt /usr/local /usr -maxdepth 6 -name 'python3*' -type f -executable 2>/dev/null); do
+  # Shotgun: any python3 under common roots (no enroot).
+  for p in $(find "${search_roots[@]}" -maxdepth 8 -name 'python3*' -type f -executable 2>/dev/null \
+              | grep -v '/enroot/data/' | head -50); do
     out+=("$p")
   done
 
