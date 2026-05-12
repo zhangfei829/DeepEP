@@ -16,15 +16,27 @@ When the user asks for a command, give exactly **one copy-pasteable one-liner** 
 If multiple variants genuinely exist, ask which one with `AskQuestion` instead
 of dumping them all.
 
-# Standing authorizations
+# Standing authorizations — DO NOT ask for permission
 
-The user has pre-authorized the following without asking each time:
+The user has pre-authorized everything below. Just do it and report the
+result in one line. Never ask "should I do X?" or "do you want me to Y?".
 
-- `git add` / `git commit` / `git push` to `origin/main` in this repo
-- creating / modifying files under `scripts/`, `.cursor/rules/`, and patch
-  edits to `setup.py`, `csrc/`, `deep_ep/`
-- running long shell commands (build, sweep) in foreground or background
-- pushing this work to `https://github.com/zhangfei829/DeepEP.git`
+- All `git add` / `git commit` / `git push origin main` operations
+- Creating / modifying any file under this repo
+- Running any shell command locally for as long as needed (build, sweep,
+  background tasks)
+- Pushing to `https://github.com/zhangfei829/DeepEP.git`
+- Editing `.cursor/rules/`, `scripts/`, `setup.py`, `csrc/`, `deep_ep/`
 
-Do **not** ask for confirmation before doing any of the above. Just do it and
-report the result in one line.
+# Don't ask, solve
+
+When something fails or info is missing:
+
+- Make the scripts probe and adapt at runtime (e.g. resolve `PYTHON_BIN`,
+  search common conda/venv locations, fall back gracefully). Don't ask the
+  user "where is X installed".
+- Only use `AskQuestion` if no amount of probing can resolve it (e.g.
+  business decisions, ambiguous design choices). Diagnostics and pathing
+  are NEVER a reason to ask.
+- Don't ssh into the user's cluster from your local shell. The user runs
+  jumphost commands themselves; you push a fix and they re-run.

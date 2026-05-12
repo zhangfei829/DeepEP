@@ -39,15 +39,57 @@ err() { printf '\033[1;31m[build:ERR]\033[0m %s\n' "$*" >&2; }
 [ -d "$CUDA_HOME" ]    || { err "CUDA_HOME not found:  $CUDA_HOME";    exit 1; }
 [ -d "$MPI_HOME" ]     || { err "MPI_HOME not found:   $MPI_HOME";     exit 1; }
 
-# Resolve a python interpreter. Some trays only have `python3`, not `python`.
-: "${PYTHON_BIN:=}"
-if [ -z "$PYTHON_BIN" ]; then
-  for cand in python3 python; do
-    if command -v "$cand" >/dev/null 2>&1; then PYTHON_BIN="$cand"; break; fi
+# Resolve a python interpreter that has `torch` importable. DeepEP setup.py
+# imports torch at top level, so a bare /usr/bin/python3 without torch is
+# useless. We try in order:
+#   1. $PYTHON_BIN if user already exported one
+#   2. each python under $PATH (python3 first, then python)
+#   3. anaconda/miniconda env pythons under common locations
+#   4. any `python3` we can find via `find`
+# and we keep only the first one that successfully `import torch`s.
+_has_torch() {
+  "$1" -c "import torch" >/dev/null 2>&1
+}
+
+_resolve_python() {
+  local p
+  if [ -n "${PYTHON_BIN:-}" ] && _has_torch "$PYTHON_BIN"; then
+    echo "$PYTHON_BIN"; return 0
+  fi
+  for p in python3 python; do
+    if command -v "$p" >/dev/null 2>&1 && _has_torch "$p"; then
+      command -v "$p"; return 0
+    fi
   done
+  local conda_pys=(
+    "$HOME"/anaconda3/envs/*/bin/python
+    "$HOME"/miniconda3/envs/*/bin/python
+    "$HOME"/anaconda3/bin/python
+    "$HOME"/miniconda3/bin/python
+    /opt/conda/envs/*/bin/python
+    /opt/conda/bin/python
+    /opt/miniconda*/bin/python
+    "$HOME"/.venv/bin/python
+    "$HOME"/venv/bin/python
+  )
+  for p in "${conda_pys[@]}"; do
+    [ -x "$p" ] || continue
+    if _has_torch "$p"; then echo "$p"; return 0; fi
+  done
+  for p in $(find "$HOME" /opt /usr/local -maxdepth 5 -name python3 -type f -executable 2>/dev/null); do
+    if _has_torch "$p"; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+
+if PYTHON_BIN=$(_resolve_python); then
+  export PYTHON_BIN
+else
+  err "no python interpreter with torch found. Tried PATH, ~/anaconda3, ~/miniconda3, /opt/conda, ~/.venv, etc."
+  err "Either set PYTHON_BIN=/path/to/python-with-torch and re-run,"
+  err "or activate your conda/venv before launching this script."
+  exit 1
 fi
-[ -n "$PYTHON_BIN" ] || { err "no python interpreter found (tried python3, python). Set PYTHON_BIN=/path/to/python"; exit 1; }
-export PYTHON_BIN
 if [ "$SKIP_NCCL_CHECK" != "1" ]; then
   [ -f "$NCCL_ROOT_DIR/lib/libnccl.so" ]    || { err "missing $NCCL_ROOT_DIR/lib/libnccl.so   - did you run 'make src.build' on NCCL?"; exit 1; }
   [ -f "$NCCL_ROOT_DIR/include/nccl.h" ]    || { err "missing $NCCL_ROOT_DIR/include/nccl.h"; exit 1; }

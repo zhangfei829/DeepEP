@@ -43,15 +43,38 @@ err()  { printf '\033[1;31m[sweep:ERR]\033[0m %s\n' "$*" >&2; }
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${EXTRA_ARGS:=}"
 
-# Resolve python interpreter (some trays only have python3, not python).
-: "${PYTHON_BIN:=}"
-if [ -z "$PYTHON_BIN" ]; then
-  for cand in python3 python; do
-    if command -v "$cand" >/dev/null 2>&1; then PYTHON_BIN="$cand"; break; fi
+# Resolve a python interpreter that has `torch` importable.
+# Same probe logic as tray_build_deepep.sh -- kept inline for self-containment.
+_has_torch() { "$1" -c "import torch" >/dev/null 2>&1; }
+_resolve_python() {
+  local p
+  if [ -n "${PYTHON_BIN:-}" ] && _has_torch "$PYTHON_BIN"; then echo "$PYTHON_BIN"; return 0; fi
+  for p in python3 python; do
+    if command -v "$p" >/dev/null 2>&1 && _has_torch "$p"; then command -v "$p"; return 0; fi
   done
-fi
-[ -n "$PYTHON_BIN" ] || { err "no python interpreter found (tried python3, python). Set PYTHON_BIN=/path/to/python"; exit 1; }
-export PYTHON_BIN
+  local conda_pys=(
+    "$HOME"/anaconda3/envs/*/bin/python
+    "$HOME"/miniconda3/envs/*/bin/python
+    "$HOME"/anaconda3/bin/python
+    "$HOME"/miniconda3/bin/python
+    /opt/conda/envs/*/bin/python
+    /opt/conda/bin/python
+    /opt/miniconda*/bin/python
+    "$HOME"/.venv/bin/python
+    "$HOME"/venv/bin/python
+  )
+  for p in "${conda_pys[@]}"; do
+    [ -x "$p" ] || continue
+    if _has_torch "$p"; then echo "$p"; return 0; fi
+  done
+  for p in $(find "$HOME" /opt /usr/local -maxdepth 5 -name python3 -type f -executable 2>/dev/null); do
+    if _has_torch "$p"; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+if PYTHON_BIN=$(_resolve_python); then export PYTHON_BIN
+else err "no python interpreter with torch found; set PYTHON_BIN or activate your conda/venv"; exit 1; fi
+log "PYTHON_BIN     = $PYTHON_BIN"
 
 # Slots per node, derived from TRAYS line one (use slots=N if hostfile already set)
 : "${SLOTS_PER_NODE:=4}"
