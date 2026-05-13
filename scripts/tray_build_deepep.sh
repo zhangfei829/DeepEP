@@ -357,9 +357,25 @@ log "linked $so_file -> deep_ep/$(basename "$so_file")"
 # and DeepEP share the exact same NCCL at runtime.
 log "patching PyTorch wheel NCCL -> $NCCL_ROOT_DIR"
 PT_NCCL_DIR=$("$PYTHON_BIN" - <<'PY' 2>/dev/null || true
+import os, sys
+# nvidia.nccl ships as a PEP 420 namespace package (no __init__.py, no
+# __file__), so we must use __path__ or scan site-packages directly.
 try:
-    import nvidia.nccl, os
-    print(os.path.join(os.path.dirname(nvidia.nccl.__file__), 'lib'))
+    import nvidia.nccl
+    paths = list(getattr(nvidia.nccl, '__path__', []) or [])
+    for p in paths:
+        d = os.path.join(p, 'lib')
+        if os.path.isdir(d):
+            print(d); sys.exit(0)
+except Exception:
+    pass
+try:
+    import site
+    cands = list(site.getsitepackages()) + [site.getusersitepackages()]
+    for sp in cands:
+        d = os.path.join(sp, 'nvidia', 'nccl', 'lib')
+        if os.path.isdir(d):
+            print(d); sys.exit(0)
 except Exception:
     pass
 PY
