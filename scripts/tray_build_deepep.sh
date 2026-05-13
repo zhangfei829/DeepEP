@@ -330,13 +330,18 @@ cd "$DEEPEP_DIR"
 log "cleaning previous build/"
 rm -rf build dist deep_ep/*.so deep_ep.egg-info
 
-log "running setup.py build (this can take a while)"
-"$PYTHON_BIN" setup.py build 2>&1 | tail -n 40
+log "running setup.py build (this can take a while; full log -> $DEEPEP_DIR/build.log)"
+"$PYTHON_BIN" setup.py build 2>&1 | tee build.log | tail -n 40
 
-# in-place .so symlink so `python tests/elastic/test_ep.py` finds the module
-so_file=$(find build -maxdepth 3 -name 'deep_ep*.so' -type f | head -n 1)
+# setup.py names the ext `deep_ep._C` -> _C.cpython-312-<arch>-linux-gnu.so
+# located under build/lib.<plat>-cpython-<pyver>/deep_ep/. Old `deep_ep*.so`
+# glob never matched because the basename is `_C.*.so`, not `deep_ep*.so`.
+so_file=$(find build -maxdepth 4 -path '*/deep_ep/*' -name '*.so' -type f \
+            ! -name 'lib*' 2>/dev/null | head -n 1)
 if [ -z "$so_file" ]; then
-  err "no built .so found under build/; full output above"
+  err "no built .so found under build/ ; full log at $DEEPEP_DIR/build.log"
+  err "last 5 .so files seen:"
+  find build -name '*.so' -type f 2>/dev/null | head -5 | sed 's/^/    /' >&2
   exit 1
 fi
 ln -sf "../$so_file" "deep_ep/$(basename "$so_file")"
