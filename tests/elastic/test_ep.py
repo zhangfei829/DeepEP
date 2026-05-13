@@ -15,7 +15,115 @@ from deep_ep.utils.envs import init_dist, init_seed, dist_print
 from deep_ep.utils.refs import dispatch as ref_dispatch
 from deep_ep.utils.refs import combine as ref_combine
 from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate
-from deep_ep.utils.testing import bench_kineto, bench_api_walltime
+from deep_ep.utils.testing import bench_kineto, bench_api_walltime, get_last_kernel_full_name
+
+
+def _extract_template_args(full_name: str):
+    """Extract the top-level template argument list of `kernel<arg, arg, ...>(...)`.
+    Returns a list of trimmed strings or None if parsing fails."""
+    if not full_name:
+        return None
+    lt = full_name.find('<')
+    if lt < 0:
+        return None
+    depth = 0
+    end = -1
+    for i in range(lt, len(full_name)):
+        c = full_name[i]
+        if c == '<':
+            depth += 1
+        elif c == '>':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end < 0:
+        return None
+    inner = full_name[lt + 1:end]
+    # split on top-level commas only
+    parts, depth, buf = [], 0, []
+    for c in inner:
+        if c == '<':
+            depth += 1
+            buf.append(c)
+        elif c == '>':
+            depth -= 1
+            buf.append(c)
+        elif c == ',' and depth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(c)
+    if buf:
+        parts.append(''.join(buf).strip())
+    return parts
+
+
+def _maybe_print_kernel_warps_metadata(printed: dict):
+    """
+    Parse dispatch_impl / hybrid_dispatch_impl / combine_impl kernel names
+    captured by bench_kineto and print a `> Warps: ...` metadata line that
+    parse_deepep_csv.py can pick up. `printed` is a per-process dedup dict.
+    """
+    def fmt_dispatch():
+        full = get_last_kernel_full_name('dispatch_impl')
+        if not full:
+            return None
+        args = _extract_template_args(full)
+        if not args:
+            return None
+        try:
+            # `dispatch_impl<bool, bool, bool, kNumSMs, kNumNotifyWarps,
+            #   kNumDispatchWarps, kNumRanks, ...>`
+            num_sms = int(args[3]); n_notify = int(args[4]); n_dispatch = int(args[5])
+        except (IndexError, ValueError):
+            return None
+        return ('dispatch', num_sms, [('notify', n_notify), ('dispatch', n_dispatch)])
+
+    def fmt_hybrid():
+        full = get_last_kernel_full_name('hybrid_dispatch_impl')
+        if not full:
+            return None
+        args = _extract_template_args(full)
+        if not args:
+            return None
+        try:
+            # `hybrid_dispatch_impl<bool, bool, kNumSMs, kNumNotifyWarps,
+            #   kNumScaleoutWarps, kNumForwardWarps, ...>`
+            num_sms = int(args[2]); n_notify = int(args[3])
+            n_scaleout = int(args[4]); n_forward = int(args[5])
+        except (IndexError, ValueError):
+            return None
+        return ('hybrid_dispatch', num_sms,
+                [('notify', n_notify), ('scaleout', n_scaleout), ('forward', n_forward)])
+
+    def fmt_combine():
+        full = get_last_kernel_full_name('combine_impl')
+        if not full:
+            return None
+        args = _extract_template_args(full)
+        if not args:
+            return None
+        try:
+            # `combine_impl<bool, bool, bool, kNumSMs, kNumWarps, kNumRanks, ...>`
+            num_sms = int(args[3]); n_warps = int(args[4])
+        except (IndexError, ValueError):
+            return None
+        return ('combine', num_sms, [('warps', n_warps)])
+
+    for fn in (fmt_dispatch, fmt_hybrid, fmt_combine):
+        info = fn()
+        if info is None:
+            continue
+        kind, num_sms, warp_groups = info
+        if printed.get(kind):
+            continue
+        total = sum(n for _, n in warp_groups)
+        breakdown = ' + '.join(f'{n} {label}' for label, n in warp_groups)
+        print(f'   > {kind} kernel: {num_sms} SMs, '
+              f'{breakdown} = {total} warps/block ({total * 32} threads/block)',
+              flush=True)
+        printed[kind] = True
 
 
 # noinspection PyUnusedLocal,PyShadowingNames
@@ -241,6 +349,10 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                                     kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('dispatch'))
             api_t = bench_api_walltime(lambda: buffer.dispatch(**dispatch_args), barrier=buffer.barrier)
+            _printed_warps_meta = getattr(test_dispatch_combine, '_printed_warps_meta', {})
+            test_dispatch_combine._printed_warps_meta = _printed_warps_meta
+            if buffer.rank_idx == 0:
+                _maybe_print_kernel_warps_metadata(_printed_warps_meta)
             dist_print(f'   * EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
@@ -330,6 +442,8 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                                     kernel_names=('combine_impl', 'combine_reduce_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('combine'))
             api_t = bench_api_walltime(lambda: buffer.combine(**combine_args), barrier=buffer.barrier)
+            if buffer.rank_idx == 0:
+                _maybe_print_kernel_warps_metadata(test_dispatch_combine._printed_warps_meta)
             dist_print(f'   @ EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'combine: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '

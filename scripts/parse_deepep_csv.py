@@ -65,6 +65,15 @@ META_RE = {
     'sms':     re.compile(r'^\s*>\s*#SM:\s*(\d+),\s*#QPs:\s*(.+?)\s*$', re.M),
 }
 
+# `> dispatch kernel: 64 SMs, 4 notify + 8 dispatch = 12 warps/block (384 threads/block)`
+# `> combine  kernel: 64 SMs, 16 warps              = 16 warps/block (512 threads/block)`
+WARP_RE = re.compile(
+    r'^\s*>\s*(?P<kind>dispatch|hybrid_dispatch|combine)\s*kernel:\s*'
+    r'(?P<sms>\d+)\s*SMs,\s*'
+    r'(?P<breakdown>.+?)\s*=\s*'
+    r'(?P<total>\d+)\s*warps/block\s*\(\s*(?P<threads>\d+)\s*threads/block\)',
+    re.M)
+
 
 def parse_one_run(log_dir: Path, tag: str):
     """Scan all rank logs for the given tag; return (per_op rows, n_logs, meta)."""
@@ -85,6 +94,15 @@ def parse_one_run(log_dir: Path, tag: str):
                         meta['num_qps'] = mm.group(2)
                     else:
                         meta[k] = mm.group(1)
+        # warp metadata (printed by tests/elastic/test_ep.py from kernel template args)
+        for mm in WARP_RE.finditer(text):
+            kind = mm.group('kind')
+            meta.setdefault('warps', {})[kind] = {
+                'sms': int(mm.group('sms')),
+                'breakdown': mm.group('breakdown').strip(),
+                'total': int(mm.group('total')),
+                'threads': int(mm.group('threads')),
+            }
         for m in LINE_RE.finditer(text):
             op = m.group('op')
             row = {
@@ -240,6 +258,7 @@ def print_markdown(runs, summaries, metas):
     def hdr(name, w):
         return f' {name:<{w}} '
 
+    W_WARPS = 22  # "4 notify + 8 dispatch"
     header = (
         '|' + hdr('EP', 2)
         + '|' + hdr('tokens', 6)
@@ -248,6 +267,7 @@ def print_markdown(runs, summaries, metas):
         + '|' + hdr('exp/rank', 8)
         + '|' + hdr('SMs', 4)
         + '|' + hdr('op', 8)
+        + '|' + hdr('warps/block (breakdown)', W_WARPS)
         + '|' + hdr('kernel Scale-Up GB/s', W_SU)
         + '|' + hdr('kernel us', W_US)
         + '|' + hdr('copy GB/s', W_COPY)
@@ -270,7 +290,16 @@ def print_markdown(runs, summaries, metas):
         except ValueError:
             exp_per_rank = 0
         num_sms = meta.get('num_sms', '?')
+        warps_meta = meta.get('warps', {}) or {}
         for op in SUMMARY_OPS:
+            # Pick the matching kernel warp record. `dispatch` op covers both
+            # plain dispatch_impl and hybrid_dispatch_impl.
+            if op == 'dispatch':
+                w = warps_meta.get('hybrid_dispatch') or warps_meta.get('dispatch')
+            else:
+                w = warps_meta.get('combine')
+            warps_cell = f'{w["total"]} ({w["breakdown"]})' if w else '?'
+
             s = summary.get(op)
             if s is None:
                 cells = ['(no data)'] * 5
@@ -282,7 +311,8 @@ def print_markdown(runs, summaries, metas):
                     + '|' + f' {exp_per_rank if exp_per_rank else "?":>8} '
                     + '|' + f' {num_sms:>4} '
                     + '|' + f' {op:<8} '
-                    + ''.join('|' + f' {c:<{w}} ' for c, w in zip(cells, (W_SU, W_US, W_COPY, W_API_BW, W_API_US)))
+                    + '|' + f' {warps_cell:<{W_WARPS}} '
+                    + ''.join('|' + f' {c:<{w_}} ' for c, w_ in zip(cells, (W_SU, W_US, W_COPY, W_API_BW, W_API_US)))
                     + '|'
                 )
                 print(row)
@@ -306,6 +336,7 @@ def print_markdown(runs, summaries, metas):
                 + '|' + f' {exp_per_rank if exp_per_rank else "":>8} '
                 + '|' + f' {num_sms:>4} '
                 + '|' + f' {op:<8} '
+                + '|' + f' {warps_cell:<{W_WARPS}} '
                 + '|' + f' {su_cell:<{W_SU}} '
                 + '|' + f' {us_cell:<{W_US}} '
                 + '|' + f' {cp_cell:<{W_COPY}} '

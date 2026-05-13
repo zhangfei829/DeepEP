@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 
+# Filled in by bench_kineto: maps short kernel name -> full demangled
+# kernel name (with template arguments). Read by callers that want to
+# extract compile-time constants like kNumNotifyWarps without rebuilding C++.
+_LAST_KERNEL_FULL_NAMES: dict = {}
+
+
+def get_last_kernel_full_name(name: str) -> Optional[str]:
+    return _LAST_KERNEL_FULL_NAMES.get(name)
+
+
 def flush_l2_cache(enabled: bool = True):
     """
     Flush the GPU L2 cache by writing a large zero-initialized tensor.
@@ -179,6 +189,15 @@ def bench_kineto(fn,
     assert all([isinstance(name, str) for name in kernel_names])
     for name in kernel_names:
         assert sum([name in line for line in prof_lines]) <= 1, f'Errors of the kernel {name} in the profiling table: {prof_lines}'
+
+    # Capture full demangled kernel name (with template args). Useful for
+    # extracting compile-time constants like kNumNotifyWarps / kNumDispatchWarps
+    # without rebuilding C++.
+    global _LAST_KERNEL_FULL_NAMES
+    for ev in profiler.key_averages():
+        for name in kernel_names:
+            if f'::{name}' in ev.key and name not in _LAST_KERNEL_FULL_NAMES:
+                _LAST_KERNEL_FULL_NAMES[name] = ev.key
 
     # Save chrome traces
     if trace_path is not None:
