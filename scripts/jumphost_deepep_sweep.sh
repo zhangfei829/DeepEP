@@ -36,13 +36,19 @@ err()  { printf '\033[1;31m[jh:%s:ERR]\033[0m %s\n' "$STAGE" "$*" >&2; }
 : "${HEAD_TRAY:=pod4-gb300-2-tray01-f3}"
 : "${TRAYS:=pod4-gb300-2-tray01-f3 pod4-gb300-2-tray02-f3 pod4-gb300-2-tray03-f3 pod4-gb300-2-tray04-f3}"
 : "${DEEPEP_DIR:=/home/fizhang/DeepEP}"
-: "${NCCL_ROOT_DIR:=/home/fizhang/nccl/build}"
+# Default to the PyPI nvidia-nccl-cu13 wheel that gets installed in stage 2.5
+# (it carries NCCL >=2.30.4 + the ncclGin_SegmentDevice device-side header
+# DeepEP V2 needs). Override only if you have a hand-built NCCL with the
+# matching Gin device API.
+: "${NCCL_ROOT_DIR:=/mnt/local/home/fizhang/.local/lib/python3.12/site-packages/nvidia/nccl}"
 : "${DEEPEP_LOG_DIR:=/home/fizhang/deepep_logs}"
 : "${RUN_ID:=$(date +%Y%m%d_%H%M%S)}"
 : "${JH_LOG_DIR:=/tmp/deepep_logs.$RUN_ID}"
-: "${GIT_REF:=origin/master}"
+: "${GIT_REF:=origin/main}"
+: "${GIT_REMOTE:=https://github.com/zhangfei829/DeepEP.git}"
 : "${SKIP_BUILD:=0}"
 : "${SKIP_SSH_SETUP:=0}"
+: "${SKIP_PIP:=0}"
 
 # Jumphost SSH key for hopping into trays
 : "${JH_SSH_KEY:=$HOME/id_ed25519}"
@@ -109,6 +115,44 @@ grep -qxFf /home/fizhang/head_tray_pub.txt ~/.ssh/authorized_keys \
     fi
   done
   log "ssh mesh OK"
+fi
+
+#==============================================================================
+# [2.5/6] Provision python env (torch + nccl wheel) on every tray
+#==============================================================================
+# Critical pitfall on GB300 NVL72: ~/.local resolves to /mnt/local/home/...
+# which is NODE-LOCAL disk, NOT shared. So a `pip install --user` on head_tray
+# does not reach workers, and mpirun-launched ranks on tray07/08/09 die with
+# `ModuleNotFoundError: No module named 'torch'`. We provision every tray.
+#
+# Skip with SKIP_PIP=1 if you've already provisioned the pool.
+STAGE=2.5
+: "${PIP_INDEX_URL:=https://download.pytorch.org/whl/nightly/cu130}"
+: "${TORCH_PIP_SPEC:=--pre torch numpy}"
+: "${NCCL_PIP_SPEC:=nvidia-nccl-cu13>=2.30.4}"
+if [ "${SKIP_PIP:-0}" = "1" ]; then
+  log "SKIP_PIP=1, skipping per-tray torch/nccl install"
+else
+  log "provisioning torch (+ nccl wheel) on every tray (pip --user --break-system-packages)"
+  for t in $TRAYS; do
+    PROBE=$("${JSSH_N[@]}" "fizhang@$t" '/usr/bin/python3 -c "import torch, nvidia.nccl, os; print(torch.__version__, [p for p in nvidia.nccl.__path__][0])" 2>/dev/null' || true)
+    if [ -n "$PROBE" ]; then
+      log "  $t already has torch+nccl ($PROBE), skipping"
+      continue
+    fi
+    log "  installing torch+nccl on $t (this can take a few minutes)"
+    if ! "${JSSH_N[@]}" "fizhang@$t" \
+        "/usr/bin/pip3 install --user --break-system-packages --index-url $PIP_INDEX_URL $TORCH_PIP_SPEC 2>&1 | tail -3 ; \
+         /usr/bin/pip3 install --user --break-system-packages --upgrade '$NCCL_PIP_SPEC' 2>&1 | tail -3"; then
+      err "pip install failed on $t"; exit 1
+    fi
+  done
+  log "verifying torch+nccl on every tray"
+  for t in $TRAYS; do
+    OUT=$("${JSSH_N[@]}" "fizhang@$t" '/usr/bin/python3 -c "import torch, nvidia.nccl, os; print(torch.__version__, torch.cuda.is_available(), [p for p in nvidia.nccl.__path__][0])"' 2>&1 | tail -1)
+    log "  $t: $OUT"
+    case "$OUT" in *Traceback*|*Error*|*"No module"*) err "torch/nccl unusable on $t"; exit 1 ;; esac
+  done
 fi
 
 #==============================================================================
