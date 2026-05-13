@@ -131,8 +131,17 @@ if __name__ == '__main__':
         # Prefer H800 series
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
 
-        # CUDA 12 flags
-        nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
+        # CUDA 12 flags. `-rdc=true` is only required for V1/NVSHMEM, which
+        # uses cooperative kernels and a separate `nvcc --device-link` step
+        # (see nvcc_dlink below). Keeping `-rdc=true` for a V2-only build
+        # (DISABLE_LEGACY=1) without nvcc_dlink results in unresolved
+        # `__cudaRegisterLinkedBinary_*` symbols at host-link time, because
+        # PyTorch CppExtension does the final link with plain g++ and never
+        # invokes nvcc to glue the device blobs together.
+        if disable_legacy:
+            nvcc_flags.extend(['--ptxas-options=--register-usage-level=10'])
+        else:
+            nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
     if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':
