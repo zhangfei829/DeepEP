@@ -160,11 +160,11 @@ fi
 #==============================================================================
 # Two skip flags here so a python-only edit to tests/ or deep_ep/ doesn't
 # force a full DeepEP rebuild:
-#   SKIP_GIT_SYNC=1 -> don't fetch/reset the repo on head_tray (use what's there)
+#   SKIP_GIT_SYNC=1 -> don't fetch/reset the repo on head_tray (default 0; git sync
+#                      is cheap, so we run it unless the user explicitly skips)
 #   SKIP_BUILD=1    -> don't re-run setup.py build (kernels unchanged)
-# Default for SKIP_GIT_SYNC tracks SKIP_BUILD for back-compat with old invocations.
 STAGE=3
-: "${SKIP_GIT_SYNC:=$SKIP_BUILD}"
+: "${SKIP_GIT_SYNC:=0}"
 if [ "$SKIP_GIT_SYNC" = "1" ]; then
   log "SKIP_GIT_SYNC=1, skipping repo sync (tests/ python files come from prior checkout)"
 else
