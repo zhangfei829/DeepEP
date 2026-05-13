@@ -158,9 +158,15 @@ fi
 #==============================================================================
 # [3/6] Sync repo + build on head_tray
 #==============================================================================
+# Two skip flags here so a python-only edit to tests/ or deep_ep/ doesn't
+# force a full DeepEP rebuild:
+#   SKIP_GIT_SYNC=1 -> don't fetch/reset the repo on head_tray (use what's there)
+#   SKIP_BUILD=1    -> don't re-run setup.py build (kernels unchanged)
+# Default for SKIP_GIT_SYNC tracks SKIP_BUILD for back-compat with old invocations.
 STAGE=3
-if [ "$SKIP_BUILD" = "1" ]; then
-  log "SKIP_BUILD=1, skipping repo sync + build"
+: "${SKIP_GIT_SYNC:=$SKIP_BUILD}"
+if [ "$SKIP_GIT_SYNC" = "1" ]; then
+  log "SKIP_GIT_SYNC=1, skipping repo sync (tests/ python files come from prior checkout)"
 else
   log "syncing repo $DEEPEP_DIR on $HEAD_TRAY (ref=$GIT_REF)"
   GIT_REMOTE_VAL="${GIT_REMOTE:-}"
@@ -194,7 +200,11 @@ echo "[3] HEAD = $(git rev-parse --short HEAD)  ($(git log -1 --pretty='%s'))"
 ls scripts/ 2>/dev/null | head -n 10
 [ -f scripts/tray_build_deepep.sh ] || { echo "[3] scripts/tray_build_deepep.sh missing after reset; ref/remote wrong?" >&2; exit 1; }
 REMOTE
+fi
 
+if [ "$SKIP_BUILD" = "1" ]; then
+  log "SKIP_BUILD=1, skipping setup.py build"
+else
   log "building DeepEP via tray_build_deepep.sh on $HEAD_TRAY"
   # ssh joins argv with spaces *without re-quoting*. To preserve env values
   # with spaces, build a single shell-safe string and pass it as ONE argv.
