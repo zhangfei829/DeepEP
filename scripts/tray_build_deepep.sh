@@ -236,7 +236,16 @@ if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "$PYTHON_BIN" ] || ! "$PYTHON_BIN" -c "imp
 fi
 export PYTHON_BIN
 if [ "$SKIP_NCCL_CHECK" != "1" ]; then
-  [ -f "$NCCL_ROOT_DIR/lib/libnccl.so" ]    || { err "missing $NCCL_ROOT_DIR/lib/libnccl.so   - did you run 'make src.build' on NCCL?"; exit 1; }
+  # PyPI nvidia-nccl-cu13 wheels ship libnccl.so.2 but no plain libnccl.so
+  # symlink. Setup.py links with `-l:libnccl.so` which needs the bare name,
+  # so synthesize the symlink if only the .so.2 form exists.
+  if [ ! -e "$NCCL_ROOT_DIR/lib/libnccl.so" ] && [ -e "$NCCL_ROOT_DIR/lib/libnccl.so.2" ]; then
+    log "creating libnccl.so -> libnccl.so.2 in $NCCL_ROOT_DIR/lib"
+    ln -sf libnccl.so.2 "$NCCL_ROOT_DIR/lib/libnccl.so" 2>/dev/null \
+      || warn "could not symlink libnccl.so (read-only fs?); link still works at runtime via -lnccl"
+  fi
+  [ -e "$NCCL_ROOT_DIR/lib/libnccl.so" ] || [ -e "$NCCL_ROOT_DIR/lib/libnccl.so.2" ] \
+    || { err "missing $NCCL_ROOT_DIR/lib/libnccl.so[.2] - point NCCL_ROOT_DIR at a real NCCL install"; exit 1; }
   [ -f "$NCCL_ROOT_DIR/include/nccl.h" ]    || { err "missing $NCCL_ROOT_DIR/include/nccl.h"; exit 1; }
 fi
 
