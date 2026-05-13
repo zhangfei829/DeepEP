@@ -31,7 +31,7 @@ err()  { printf '\033[1;31m[sweep:ERR]\033[0m %s\n' "$*" >&2; }
 # ----- defaults --------------------------------------------------------------
 : "${EP_SIZES:=4 8 16}"
 : "${TOKENS:=1024 2048 4096 8192}"
-: "${TOPK_EXPERTS:=8:256 6:256}"
+: "${TOPK_EXPERTS:=8:256}"
 : "${FP8:=1}"
 # Disable @torch.compile during `import deep_ep` to dodge nightly inductor bugs;
 # DeepEP hot path is in CUDA kernels.
