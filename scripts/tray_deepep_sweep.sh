@@ -96,19 +96,26 @@ _check_python() {
   local py="$1"
   _CHECK_PY_PATH=""; _CHECK_PY_TVER=""
   "$py" -c 'import sys' >/dev/null 2>&1 || return 1
-  local tver
+  local tver err
   tver=$("$py" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
   if [ -n "$tver" ]; then _CHECK_PY_TVER="$tver"; return 0; fi
+  err=$("$py" -c 'import torch' 2>&1 | tail -n 1)
+  printf '      ! %s plain import failed: %s\n' "$py" "$err" >&2
   local py_dir venv_root site
   py_dir=$(dirname "$py"); venv_root=$(dirname "$py_dir")
   for site in "$venv_root"/lib/python*/site-packages \
               "$venv_root"/lib64/python*/site-packages \
               "$venv_root"/lib/python*/dist-packages; do
-    [ -d "$site/torch" ] || continue
+    if [ ! -d "$site" ];       then printf '      . no site dir   %s\n' "$site" >&2; continue; fi
+    if [ ! -d "$site/torch" ]; then printf '      . no torch in   %s\n' "$site" >&2; continue; fi
+    printf '      ? trying PYTHONPATH=%s ...' "$site" >&2
     tver=$(PYTHONPATH="$site${PYTHONPATH:+:$PYTHONPATH}" "$py" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
     if [ -n "$tver" ]; then
+      echo " ok (torch=$tver)" >&2
       _CHECK_PY_PATH="$site"; _CHECK_PY_TVER="$tver"; return 0
     fi
+    err=$(PYTHONPATH="$site${PYTHONPATH:+:$PYTHONPATH}" "$py" -c 'import torch' 2>&1 | tail -n 1)
+    echo " failed: $err" >&2
   done
   return 1
 }
