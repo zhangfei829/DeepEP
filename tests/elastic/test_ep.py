@@ -15,7 +15,7 @@ from deep_ep.utils.envs import init_dist, init_seed, dist_print
 from deep_ep.utils.refs import dispatch as ref_dispatch
 from deep_ep.utils.refs import combine as ref_combine
 from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate
-from deep_ep.utils.testing import bench_kineto
+from deep_ep.utils.testing import bench_kineto, bench_api_walltime
 
 
 # noinspection PyUnusedLocal,PyShadowingNames
@@ -240,32 +240,38 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             t, copy_t = bench_kineto(lambda: buffer.dispatch(**dispatch_args),
                                     kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('dispatch'))
+            api_t = bench_api_walltime(lambda: buffer.dispatch(**dispatch_args), barrier=buffer.barrier)
             dist_print(f'   * EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'copy: {2 * num_recv_tokens * num_bytes_per_dispatch_token / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
+                    f'copy: {2 * num_recv_tokens * num_bytes_per_dispatch_token / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
 
             # Test expanded dispatch performance
             num_bytes_per_dispatch_token_meta = safe_div(count_bytes(expanded_handle.recv_src_metadata), expanded_handle.recv_src_metadata.size(0))
             t, copy_t = bench_kineto(lambda: buffer.dispatch(**expanded_dispatch_args),
                                     kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('expanded_dispatch'))
+            api_t = bench_api_walltime(lambda: buffer.dispatch(**expanded_dispatch_args), barrier=buffer.barrier)
             dist_print(f'   - EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'expanded dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'copy: {(num_recv_tokens * (num_bytes_per_dispatch_token_meta + num_bytes_per_dispatch_token) + num_expanded_tokens * num_bytes_per_dispatch_token) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
+                    f'copy: {(num_recv_tokens * (num_bytes_per_dispatch_token_meta + num_bytes_per_dispatch_token) + num_expanded_tokens * num_bytes_per_dispatch_token) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
 
             # Test cached dispatch performance
             t, copy_t = bench_kineto(lambda: buffer.dispatch(**cached_dispatch_args),
                                     kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('cached_dispatch'))
+            api_t = bench_api_walltime(lambda: buffer.dispatch(**cached_dispatch_args), barrier=buffer.barrier)
             dist_print(f'   # EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'cached dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'copy: {2 * num_scaleup_bytes / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
+                    f'copy: {2 * num_scaleup_bytes / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
 
             # Test combine performance
             num_bytes_per_combine_token = safe_div(count_bytes(recv_x_bf16, recv_topk_weights), recv_x_bf16.size(0))
@@ -323,22 +329,26 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             t, copy_t = bench_kineto(lambda: buffer.combine(**combine_args),
                                     kernel_names=('combine_impl', 'combine_reduce_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('combine'))
+            api_t = bench_api_walltime(lambda: buffer.combine(**combine_args), barrier=buffer.barrier)
             dist_print(f'   @ EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'combine: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'reduce: {(num_bias_bytes + num_reduction_read_bytes + num_reduction_write_bytes) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
+                    f'reduce: {(num_bias_bytes + num_reduction_read_bytes + num_reduction_write_bytes) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
 
             # Test reduced combine performance
             num_scaleout_bytes, num_scaleup_bytes, num_reduction_read_bytes = get_combine_bytes(True)
             t, copy_t = bench_kineto(lambda: buffer.combine(**reduced_combine_args),
                                     kernel_names=('combine_impl', 'combine_reduce_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('reduced_combine'))
+            api_t = bench_api_walltime(lambda: buffer.combine(**reduced_combine_args), barrier=buffer.barrier)
             dist_print(f'   + EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'reduced combine: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'reduce: {(num_bias_bytes + num_reduction_read_bytes + num_reduction_write_bytes) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
+                    f'reduce: {(num_bias_bytes + num_reduction_read_bytes + num_reduction_write_bytes) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
             dist_print(once_in_node=True)
 
         # Checks

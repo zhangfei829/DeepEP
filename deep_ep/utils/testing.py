@@ -217,3 +217,55 @@ def bench_kineto(fn,
 
     # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]
+
+
+def bench_api_walltime(fn,
+                       num_tests: int = 10,
+                       num_warmup: int = 3,
+                       flush_l2: bool = True,
+                       barrier_comm_profiling: bool = True,
+                       barrier: Optional[Callable] = None) -> float:
+    """
+    End-to-end wall-clock benchmark *including host overhead* (Python call
+    cost, kernel launch latency, post-dispatch sync). Pairs with
+    `bench_kineto` (which measures device-only kernel time) so the caller
+    can report both "kernel GB/s" and "API GB/s" in the same line, matching
+    the convention used by Hybrid_ep / NCCL EP statistic columns.
+
+    Returns:
+        average wall-clock seconds per `fn()` call.
+    """
+    import time
+
+    # Warm-up + auto-tuning settle.
+    for _ in range(num_warmup):
+        fn()
+    torch.cuda.synchronize()
+    if barrier is not None and barrier_comm_profiling:
+        barrier()
+
+    durations = []
+    dummy = torch.ones(1, dtype=torch.float, device='cuda')
+    for _ in range(num_tests):
+        if flush_l2:
+            flush_l2_cache(True)
+        # Match `bench_kineto` shape: an inserted barrier so all ranks
+        # start the timed region within ~10 us of each other.
+        if barrier_comm_profiling:
+            torch.cuda._sleep(int(2e7))  # ~10 ms
+            if barrier is None:
+                dist.all_reduce(dummy)
+            else:
+                barrier()
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        durations.append(time.perf_counter() - t0)
+
+    # Trim min/max to dampen GPU clock outliers.
+    if len(durations) >= 5:
+        durations.sort()
+        durations = durations[1:-1]
+    return sum(durations) / len(durations)
