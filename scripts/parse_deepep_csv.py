@@ -202,13 +202,14 @@ def print_markdown(runs, summaries):
 
     rows.sort(key=key)
     print()
-    # Legend
-    print('Legend:')
-    print('  SO     = Scale-Out  bandwidth (cross-NVL72 RDMA);   0 GB/s when all ranks fit in one NVLink domain')
-    print('  SU     = Scale-Up   bandwidth (intra-NVL72 NVLink); GB/s = scaleup_recv_bytes / time')
-    print('  kernel = device-only time from kineto (CUDA kernel duration); GB/s = bytes / kernel_us')
-    print('  api    = end-to-end host wall time (Python call + kernel launch + sync), comparable to Hybrid_ep / NCCL EP "API GB/s"; GB/s = bytes / api_us')
-    print('  cells  = min / avg / max aggregated across all ranks in the run')
+    # Legend (Chinese): make it impossible to miss what SO/SU/kernel/api mean.
+    print('图例:')
+    print('  RDMA   = Scale-Out (SO) 跨 NVL72 网卡带宽 (GB/s)。所有 rank 都在同一个 NVL72 NVLink 域内时恒为 0。')
+    print('  NVLink = Scale-Up  (SU) NVL72 内 NVLink 带宽 (GB/s) = scaleup_recv_bytes / time。')
+    print('  kernel = 仅设备侧 CUDA kernel 执行时间 (kineto 测出)。GB/s = bytes / kernel_us。')
+    print('  api    = 端到端 host wall time，包含 Python 调用 + kernel launch + sync。')
+    print('           对应 Hybrid_ep / NCCL EP 报表里的 "API GB/s"。GB/s = bytes / api_us。')
+    print('  单元格  = min / avg / max，跨所有 rank 聚合。')
     print()
 
     # Column widths chosen so cell + header are equal length -> aligned in
@@ -229,12 +230,12 @@ def print_markdown(runs, summaries):
         + '|' + hdr('topk', 4)
         + '|' + hdr('exp', 3)
         + '|' + hdr('op', 8)
-        + '|' + hdr('kernel SO GB/s', W_SO)
-        + '|' + hdr('kernel SU GB/s', W_SU)
+        + '|' + hdr('kernel RDMA GB/s', W_SO)
+        + '|' + hdr('kernel NVLink GB/s', W_SU)
         + '|' + hdr('kernel us', W_US)
         + '|' + hdr('copy GB/s', W_COPY)
-        + '|' + hdr('api SO GB/s', W_API_BW)
-        + '|' + hdr('api SU GB/s', W_API_BW)
+        + '|' + hdr('api RDMA GB/s', W_API_BW)
+        + '|' + hdr('api NVLink GB/s', W_API_BW)
         + '|' + hdr('api us', W_API_US)
         + '|'
     )
