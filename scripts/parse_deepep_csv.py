@@ -202,23 +202,21 @@ def print_markdown(runs, summaries):
 
     rows.sort(key=key)
     print()
-    # Legend (Chinese): make it impossible to miss what SO/SU/kernel/api mean.
+    # Legend (Chinese)
     print('图例:')
-    print('  RDMA   = Scale-Out (SO) 跨 NVL72 网卡带宽 (GB/s)。所有 rank 都在同一个 NVL72 NVLink 域内时恒为 0。')
-    print('  NVLink = Scale-Up  (SU) NVL72 内 NVLink 带宽 (GB/s) = scaleup_recv_bytes / time。')
-    print('  kernel = 仅设备侧 CUDA kernel 执行时间 (kineto 测出)。GB/s = bytes / kernel_us。')
-    print('  api    = 端到端 host wall time，包含 Python 调用 + kernel launch + sync。')
-    print('           对应 Hybrid_ep / NCCL EP 报表里的 "API GB/s"。GB/s = bytes / api_us。')
-    print('  单元格  = min / avg / max，跨所有 rank 聚合。')
+    print('  Scale-Up = NVL72 内 NVLink 带宽 (GB/s) = scaleup_recv_bytes / time。本测试所有 rank 都在同一 NVL72 NVLink 域内,流量全走 Scale-Up。')
+    print('  kernel   = 仅设备侧 CUDA kernel 执行时间 (kineto)。GB/s = bytes / kernel_us。')
+    print('  api      = 端到端 host wall time,包含 Python 调用 + kernel launch + sync。对应 Hybrid_ep / NCCL EP 报表里的 "API GB/s"。GB/s = bytes / api_us。')
+    print('  单元格    = min / avg / max,跨所有 rank 聚合。')
     print()
 
-    # Column widths chosen so cell + header are equal length -> aligned in
-    # both monospace renderers and Markdown viewers.
-    W_SO       = 17   # "0 /   0.0 /   0"
+    # Column widths chosen so cell + header are equal length -> aligned.
+    # Scale-Out (RDMA) columns are omitted in single-NVL72 sweeps because
+    # they are always 0; parse_deepep_csv.py CSV output still keeps them.
     W_SU       = 21   # "486 / 489.5 / 496"
     W_US       = 24   # " 27.97 /  28.24 /  28.45"
     W_COPY     = 9    #  "4607.8 "
-    W_API_BW   = 21   #  for api SO, api SU
+    W_API_BW   = 21
     W_API_US   = 24
 
     def hdr(name, w):
@@ -230,12 +228,10 @@ def print_markdown(runs, summaries):
         + '|' + hdr('topk', 4)
         + '|' + hdr('exp', 3)
         + '|' + hdr('op', 8)
-        + '|' + hdr('kernel RDMA GB/s', W_SO)
-        + '|' + hdr('kernel NVLink GB/s', W_SU)
+        + '|' + hdr('kernel Scale-Up GB/s', W_SU)
         + '|' + hdr('kernel us', W_US)
         + '|' + hdr('copy GB/s', W_COPY)
-        + '|' + hdr('api RDMA GB/s', W_API_BW)
-        + '|' + hdr('api NVLink GB/s', W_API_BW)
+        + '|' + hdr('api Scale-Up GB/s', W_API_BW)
         + '|' + hdr('api us', W_API_US)
         + '|'
     )
@@ -250,30 +246,28 @@ def print_markdown(runs, summaries):
         for op in SUMMARY_OPS:
             s = summary.get(op)
             if s is None:
-                cells = ['(no data)'] * 7
+                cells = ['(no data)'] * 5
                 row = (
                     '|' + f' {str(run.get("ep","?")):>2} '
                     + '|' + f' {str(run.get("tokens","?")):>6} '
                     + '|' + f' {str(run.get("topk","?")):>4} '
                     + '|' + f' {str(run.get("experts","?")):>3} '
                     + '|' + f' {op:<8} '
-                    + ''.join('|' + f' {c:<{w}} ' for c, w in zip(cells, (W_SO, W_SU, W_US, W_COPY, W_API_BW, W_API_BW, W_API_US)))
+                    + ''.join('|' + f' {c:<{w}} ' for c, w in zip(cells, (W_SU, W_US, W_COPY, W_API_BW, W_API_US)))
                     + '|'
                 )
                 print(row)
                 continue
 
-            so_cell  = f'{s["so_min"]:>3} / {s["so_avg"]:>5.1f} / {s["so_max"]:>3}'
             su_cell  = f'{s["su_min"]:>3} / {s["su_avg"]:>5.1f} / {s["su_max"]:>3}'
             us_cell  = f'{s["us_min"]:>6.2f} / {s["us_avg"]:>6.2f} / {s["us_max"]:>6.2f}'
             cp_cell  = f'{s["copy_gbs_avg"]:>6.1f}'
 
             if 'api_us_avg' in s:
-                api_so_cell = f'{s["api_so_min"]:>3} / {s["api_so_avg"]:>5.1f} / {s["api_so_max"]:>3}'
                 api_su_cell = f'{s["api_su_min"]:>3} / {s["api_su_avg"]:>5.1f} / {s["api_su_max"]:>3}'
                 api_us_cell = f'{s["api_us_min"]:>6.2f} / {s["api_us_avg"]:>6.2f} / {s["api_us_max"]:>6.2f}'
             else:
-                api_so_cell = api_su_cell = api_us_cell = '(no data)'
+                api_su_cell = api_us_cell = '(no data)'
 
             row = (
                 '|' + f' {str(run.get("ep","")):>2} '
@@ -281,11 +275,9 @@ def print_markdown(runs, summaries):
                 + '|' + f' {str(run.get("topk","")):>4} '
                 + '|' + f' {str(run.get("experts","")):>3} '
                 + '|' + f' {op:<8} '
-                + '|' + f' {so_cell:<{W_SO}} '
                 + '|' + f' {su_cell:<{W_SU}} '
                 + '|' + f' {us_cell:<{W_US}} '
                 + '|' + f' {cp_cell:<{W_COPY}} '
-                + '|' + f' {api_so_cell:<{W_API_BW}} '
                 + '|' + f' {api_su_cell:<{W_API_BW}} '
                 + '|' + f' {api_us_cell:<{W_API_US}} '
                 + '|'
