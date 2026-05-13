@@ -30,6 +30,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // The integer type of top-k indices
     m.attr("topk_idx_t") = py::cast(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value);
 
+    // `EventHandle` is a shared utility used by both V1 (legacy) and V2
+    // (elastic) paths -- e.g. `ElasticBuffer::capture()` returns one --
+    // so it must be registered unconditionally, regardless of DISABLE_LEGACY.
+    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
+        .def(pybind11::init<>())
+        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+
     // JIT API
     deep_ep::jit::register_apis(m);
 

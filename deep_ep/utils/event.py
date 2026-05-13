@@ -1,8 +1,15 @@
 import torch
 from typing import Any, Optional, Tuple
 
-# noinspection PyUnresolvedReferences
-from deep_ep._C import EventHandle
+# Legacy V1 symbol. When the extension was built with DISABLE_LEGACY=1
+# (V2-only build), `EventHandle` is not registered in `_C`. Keep the name
+# importable as `None` so `deep_ep/__init__.py` and downstream V2 code
+# (which doesn't actually use `EventHandle`) can still import cleanly.
+try:
+    # noinspection PyUnresolvedReferences
+    from deep_ep._C import EventHandle
+except ImportError:
+    EventHandle = None  # type: ignore
 
 
 class EventOverlap:
