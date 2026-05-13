@@ -33,6 +33,10 @@ err()  { printf '\033[1;31m[sweep:ERR]\033[0m %s\n' "$*" >&2; }
 : "${TOKENS:=1024 2048 4096 8192}"
 : "${TOPK_EXPERTS:=8:256 6:256}"
 : "${FP8:=1}"
+# Disable @torch.compile during `import deep_ep` to dodge nightly inductor bugs;
+# DeepEP hot path is in CUDA kernels.
+: "${DEEPEP_DISABLE_TORCH_COMPILE:=1}"
+export DEEPEP_DISABLE_TORCH_COMPILE
 
 : "${TRAYS:=pod4-gb300-2-tray01-f3 pod4-gb300-2-tray02-f3 pod4-gb300-2-tray03-f3 pod4-gb300-2-tray04-f3}"
 : "${DEEPEP_DIR:=/home/fizhang/DeepEP}"
@@ -268,6 +272,7 @@ run_one() {
     --mca plm_rsh_args "-i ${HOME}/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR" \
     -x PATH -x LD_LIBRARY_PATH -x CUDA_HOME -x MPI_HOME \
     -x PYTHONPATH -x EP_NCCL_ROOT_DIR \
+    -x DEEPEP_DISABLE_TORCH_COMPILE \
     -x NCCL_DEBUG -x EP_BUFFER_DEBUG \
     -x MASTER_ADDR="$MASTER_ADDR" -x MASTER_PORT="$MASTER_PORT" \
     -x DEEPEP_LOG_DIR="$DEEPEP_LOG_DIR" -x DEEPEP_RUN_TAG="$tag" \

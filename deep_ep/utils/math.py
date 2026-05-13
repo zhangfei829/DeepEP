@@ -1,5 +1,25 @@
+import os
 import torch
 from typing import Tuple
+
+# Make @torch.compile optional. Some PyTorch nightlies trigger a TypeError
+# inside torch._inductor.codegen.cutedsl during decorator evaluation:
+#
+#   TypeError: Too few arguments for <class 'torch._inductor.codegen.common.CSE'>
+#
+# which crashes `import deep_ep` even though we never invoke the compiled
+# function. Setting DEEPEP_DISABLE_TORCH_COMPILE=1 makes the decorator a
+# no-op so the host-side FP8 cast helpers fall back to eager execution
+# (DeepEP's hot path is in CUDA kernels; eager casts are fine).
+_DEEPEP_DISABLE_TORCH_COMPILE = int(os.environ.get('DEEPEP_DISABLE_TORCH_COMPILE', '0'))
+
+
+def _maybe_torch_compile(*args, **kwargs):
+    if _DEEPEP_DISABLE_TORCH_COMPILE:
+        def _identity(fn):
+            return fn
+        return _identity
+    return torch.compile(*args, **kwargs)
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -27,7 +47,7 @@ def align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
-@torch.compile(dynamic=True)
+@_maybe_torch_compile(dynamic=True)
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
@@ -39,7 +59,7 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         m, aligned_n)[:, :n].contiguous(), (x_amax / 448.0).view(m, -1)
 
 
-@torch.compile(dynamic=True)
+@_maybe_torch_compile(dynamic=True)
 def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor) -> torch.Tensor:
     if x_fp8.numel() == 0:
         return x_fp8.to(torch.bfloat16)

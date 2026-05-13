@@ -33,6 +33,12 @@ err() { printf '\033[1;31m[build:ERR]\033[0m %s\n' "$*" >&2; }
 # so this is the default for GB300/sm_103 sweep work: faster compile, no NVSHMEM
 # dependency. Set DISABLE_LEGACY=0 if you also want to test V1.
 : "${DISABLE_LEGACY:=1}"
+# Some recent PyTorch nightlies (e.g. 2.13.dev20260512+cu130) crash at
+# `@torch.compile` decorator evaluation due to an inductor typing bug. The
+# decorated functions in DeepEP are FP8 cast helpers, never hot path, so
+# we default to plain eager execution.
+: "${DEEPEP_DISABLE_TORCH_COMPILE:=1}"
+export DEEPEP_DISABLE_TORCH_COMPILE
 
 # ----- sanity ----------------------------------------------------------------
 [ -d "$DEEPEP_DIR" ]   || { err "DEEPEP_DIR not found: $DEEPEP_DIR";   exit 1; }
