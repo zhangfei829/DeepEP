@@ -58,15 +58,33 @@ def _safe_stat(fn, xs):
     return float(fn(xs)) if xs else float('nan')
 
 
+META_RE = {
+    'ranks':   re.compile(r'^\s*>\s*Ranks:\s*(.+?)\s*$', re.M),
+    'experts': re.compile(r'^\s*>\s*Experts:\s*(.+?)\s*$', re.M),
+    'tokens':  re.compile(r'^\s*>\s*Tokens:\s*(.+?)\s*$', re.M),
+    'sms':     re.compile(r'^\s*>\s*#SM:\s*(\d+),\s*#QPs:\s*(.+?)\s*$', re.M),
+}
+
+
 def parse_one_run(log_dir: Path, tag: str):
-    """Scan all rank logs for the given tag; return dict[op] -> list of per-rank dicts."""
+    """Scan all rank logs for the given tag; return (per_op rows, n_logs, meta)."""
     per_op = {op: [] for op in OP_NAMES}
+    meta = {}
     log_paths = sorted(log_dir.glob(f'{tag}.rank*.log'))
     for p in log_paths:
         try:
             text = p.read_text(errors='replace')
         except OSError:
             continue
+        if not meta:
+            for k, regex in META_RE.items():
+                mm = regex.search(text)
+                if mm:
+                    if k == 'sms':
+                        meta['num_sms'] = mm.group(1)
+                        meta['num_qps'] = mm.group(2)
+                    else:
+                        meta[k] = mm.group(1)
         for m in LINE_RE.finditer(text):
             op = m.group('op')
             row = {
@@ -84,7 +102,7 @@ def parse_one_run(log_dir: Path, tag: str):
                 row['api_su_gbs'] = int(m.group('api_su'))
                 row['api_us'] = float(m.group('api_us'))
             per_op[op].append(row)
-    return per_op, len(log_paths)
+    return per_op, len(log_paths), meta
 
 
 def aggregate(per_op_rows):
@@ -184,14 +202,14 @@ def write_csv(log_dir: Path, tag: str, runs, summaries):
     return out
 
 
-def print_markdown(runs, summaries):
+def print_markdown(runs, summaries, metas):
     """Print a compact dispatch+combine summary, sorted by (ep, tokens, topk, experts)."""
     rows = []
-    for run, summary in zip(runs, summaries):
-        rows.append((run, summary))
+    for run, summary, meta in zip(runs, summaries, metas):
+        rows.append((run, summary, meta))
 
     def key(rs):
-        run, _ = rs
+        run, _, _ = rs
         try:
             return (int(run.get('ep') or 0),
                     int(run.get('tokens') or 0),
@@ -227,6 +245,8 @@ def print_markdown(runs, summaries):
         + '|' + hdr('tokens', 6)
         + '|' + hdr('topk', 4)
         + '|' + hdr('exp', 3)
+        + '|' + hdr('exp/rank', 8)
+        + '|' + hdr('SMs', 4)
         + '|' + hdr('op', 8)
         + '|' + hdr('kernel Scale-Up GB/s', W_SU)
         + '|' + hdr('kernel us', W_US)
@@ -242,7 +262,14 @@ def print_markdown(runs, summaries):
     def fmt_triple(lo, avg, hi, fmt='>5.1f'):
         return f'{lo:>5.1f} / {avg:{fmt}} / {hi:>5.1f}' if isinstance(lo, float) else f'{lo:>5} / {avg:>5.1f} / {hi:>5}'
 
-    for run, summary in rows:
+    for run, summary, meta in rows:
+        try:
+            ep_i = int(run.get('ep') or 0)
+            exp_i = int(run.get('experts') or 0)
+            exp_per_rank = (exp_i // ep_i) if ep_i > 0 else 0
+        except ValueError:
+            exp_per_rank = 0
+        num_sms = meta.get('num_sms', '?')
         for op in SUMMARY_OPS:
             s = summary.get(op)
             if s is None:
@@ -252,6 +279,8 @@ def print_markdown(runs, summaries):
                     + '|' + f' {str(run.get("tokens","?")):>6} '
                     + '|' + f' {str(run.get("topk","?")):>4} '
                     + '|' + f' {str(run.get("experts","?")):>3} '
+                    + '|' + f' {exp_per_rank if exp_per_rank else "?":>8} '
+                    + '|' + f' {num_sms:>4} '
                     + '|' + f' {op:<8} '
                     + ''.join('|' + f' {c:<{w}} ' for c, w in zip(cells, (W_SU, W_US, W_COPY, W_API_BW, W_API_US)))
                     + '|'
@@ -274,6 +303,8 @@ def print_markdown(runs, summaries):
                 + '|' + f' {str(run.get("tokens","")):>6} '
                 + '|' + f' {str(run.get("topk","")):>4} '
                 + '|' + f' {str(run.get("experts","")):>3} '
+                + '|' + f' {exp_per_rank if exp_per_rank else "":>8} '
+                + '|' + f' {num_sms:>4} '
                 + '|' + f' {op:<8} '
                 + '|' + f' {su_cell:<{W_SU}} '
                 + '|' + f' {us_cell:<{W_US}} '
@@ -301,15 +332,17 @@ def main():
         sys.exit(f'[parse] no runs found for tag={args.tag} in {log_dir}')
 
     summaries = []
+    metas = []
     for run in runs:
-        per_op, n_logs = parse_one_run(log_dir, run['tag'])
+        per_op, n_logs, meta = parse_one_run(log_dir, run['tag'])
         if n_logs == 0:
             print(f'[parse] WARN: no logs for run_tag={run["tag"]}', file=sys.stderr)
         summaries.append(aggregate(per_op))
+        metas.append(meta)
 
     csv_path = write_csv(log_dir, args.tag, runs, summaries)
     print(f'[parse] wrote {csv_path}')
-    print_markdown(runs, summaries)
+    print_markdown(runs, summaries, metas)
 
 
 if __name__ == '__main__':
