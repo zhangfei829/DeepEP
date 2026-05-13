@@ -129,51 +129,62 @@ _collect_python_candidates() {
 _check_python() {
   local py="$1"
   _CHECK_PY_PATH=""
+  _CHECK_PY_LDLIB=""
   _CHECK_PY_TVER=""
-  # Sanity: must actually behave like a python interpreter. Things like
-  # python3.12-config or python3-unidiff don't accept `-c '...'`; they print
-  # their own usage banner to stdout *and* exit 0 on some distros, fooling
-  # any string-based probe. A real interpreter accepts `import sys`.
+  # Sanity: must behave like a python interpreter (rejects python3.12-config etc).
   "$py" -c 'import sys' >/dev/null 2>&1 || return 1
   local tver
   tver=$("$py" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
   if [ -n "$tver" ]; then
     _CHECK_PY_TVER="$tver"; return 0
   fi
-  # Capture WHY plain `import torch` failed so the user can see it.
   local err
   err=$("$py" -c 'import torch' 2>&1 | tail -n 1)
   printf '      ! %s plain import failed: %s\n' "$py" "$err" >&2
-  local py_dir venv_root site
+  # Try injecting site-packages (PYTHONPATH) and torch/lib (LD_LIBRARY_PATH).
+  # PyTorch wheels rely on RPATH=$ORIGIN to find sibling .so files in
+  # torch/lib/; on some shared-FS mounts $ORIGIN does not resolve and the
+  # `import torch` fails with a misleading "cannot open shared object file:
+  # No such file or directory" pointing at libtorch_global_deps.so even
+  # though the file is there. Forcing LD_LIBRARY_PATH=<site>/torch/lib
+  # restores resolution.
+  local py_dir venv_root site torchlib
   py_dir=$(dirname "$py")
   venv_root=$(dirname "$py_dir")
   for site in "$venv_root"/lib/python*/site-packages \
               "$venv_root"/lib64/python*/site-packages \
               "$venv_root"/lib/python*/dist-packages; do
-    if [ ! -d "$site" ]; then
-      printf '      . no site dir   %s\n' "$site" >&2; continue
-    fi
-    if [ ! -d "$site/torch" ]; then
-      printf '      . no torch in   %s\n' "$site" >&2; continue
-    fi
-    printf '      ? trying PYTHONPATH=%s ...' "$site" >&2
-    tver=$(PYTHONPATH="$site${PYTHONPATH:+:$PYTHONPATH}" "$py" \
-            -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
+    if [ ! -d "$site" ];       then printf '      . no site dir   %s\n' "$site" >&2; continue; fi
+    if [ ! -d "$site/torch" ]; then printf '      . no torch in   %s\n' "$site" >&2; continue; fi
+    torchlib="$site/torch/lib"
+    printf '      ? PYTHONPATH=%s LD_LIBRARY_PATH=%s ...' "$site" "$torchlib" >&2
+    tver=$(PYTHONPATH="$site${PYTHONPATH:+:$PYTHONPATH}" \
+           LD_LIBRARY_PATH="$torchlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+           "$py" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
     if [ -n "$tver" ]; then
       echo " ok (torch=$tver)" >&2
-      _CHECK_PY_PATH="$site"; _CHECK_PY_TVER="$tver"; return 0
+      _CHECK_PY_PATH="$site"; _CHECK_PY_LDLIB="$torchlib"; _CHECK_PY_TVER="$tver"
+      return 0
     fi
-    err=$(PYTHONPATH="$site${PYTHONPATH:+:$PYTHONPATH}" "$py" \
-            -c 'import torch' 2>&1 | tail -n 1)
+    err=$(PYTHONPATH="$site${PYTHONPATH:+:$PYTHONPATH}" \
+          LD_LIBRARY_PATH="$torchlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+          "$py" -c 'import torch' 2>&1 | tail -n 1)
     echo " failed: $err" >&2
+    if [ -f "$torchlib/libtorch_global_deps.so" ] && command -v ldd >/dev/null 2>&1; then
+      local missing
+      missing=$(LD_LIBRARY_PATH="$torchlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                ldd "$torchlib/libtorch_global_deps.so" 2>&1 | grep -E 'not found|=>\s*not' | head -3)
+      [ -n "$missing" ] && printf '        ldd missing deps:\n%s\n' "$missing" | sed 's/^/          /' >&2
+    fi
   done
   return 1
 }
 
-# Probe all candidates. Mutates global PYTHON_BIN and (if needed) PYTHONPATH.
+# Probe all candidates. Mutates global PYTHON_BIN and (if needed)
+# PYTHONPATH / LD_LIBRARY_PATH.
 _resolve_python() {
   echo "[build] probing python interpreters for torch..." >&2
-  local p chosen="" chosen_pp=""
+  local p chosen="" chosen_pp="" chosen_ld=""
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     if [ ! -x "$p" ]; then
@@ -183,13 +194,13 @@ _resolve_python() {
     ver=$("$p" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo "?")
     if _check_python "$p"; then
       if [ -n "$_CHECK_PY_PATH" ]; then
-        printf '  + %-50s  python=%s torch=%s  <-- using (PYTHONPATH=%s)\n' \
-          "$p" "$ver" "$_CHECK_PY_TVER" "$_CHECK_PY_PATH" >&2
+        printf '  + %-50s  python=%s torch=%s  <-- using (PYTHONPATH=%s LD_LIBRARY_PATH+=%s)\n' \
+          "$p" "$ver" "$_CHECK_PY_TVER" "$_CHECK_PY_PATH" "$_CHECK_PY_LDLIB" >&2
       else
         printf '  + %-50s  python=%s torch=%s  <-- using\n' \
           "$p" "$ver" "$_CHECK_PY_TVER" >&2
       fi
-      chosen="$p"; chosen_pp="$_CHECK_PY_PATH"; break
+      chosen="$p"; chosen_pp="$_CHECK_PY_PATH"; chosen_ld="$_CHECK_PY_LDLIB"; break
     else
       printf '  - %-50s  python=%s (no torch)\n' "$p" "$ver" >&2
     fi
@@ -199,6 +210,10 @@ _resolve_python() {
   if [ -n "$chosen_pp" ]; then
     export PYTHONPATH="$chosen_pp${PYTHONPATH:+:$PYTHONPATH}"
     echo "[build] injected PYTHONPATH=$PYTHONPATH" >&2
+  fi
+  if [ -n "$chosen_ld" ]; then
+    export LD_LIBRARY_PATH="$chosen_ld${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "[build] injected LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >&2
   fi
   return 0
 }
