@@ -152,11 +152,11 @@ ls scripts/ 2>/dev/null | head -n 10
 REMOTE
 
   log "building DeepEP via tray_build_deepep.sh on $HEAD_TRAY"
-  "${JSSH[@]}" "fizhang@$HEAD_TRAY" \
-    DEEPEP_DIR="$DEEPEP_DIR" NCCL_ROOT_DIR="$NCCL_ROOT_DIR" \
-    PYTHON_BIN="${PYTHON_BIN:-}" DISABLE_LEGACY="${DISABLE_LEGACY:-1}" \
-    bash -l "$DEEPEP_DIR/scripts/tray_build_deepep.sh" 2>&1 \
-    | sed 's/^/    /'
+  "${JSSH[@]}" "fizhang@$HEAD_TRAY" bash -l -c "$(
+    printf "DEEPEP_DIR=%q NCCL_ROOT_DIR=%q PYTHON_BIN=%q DISABLE_LEGACY=%q bash -l %q" \
+      "$DEEPEP_DIR" "$NCCL_ROOT_DIR" "${PYTHON_BIN:-}" "${DISABLE_LEGACY:-1}" \
+      "$DEEPEP_DIR/scripts/tray_build_deepep.sh"
+  )" 2>&1 | sed 's/^/    /'
 fi
 
 #==============================================================================
@@ -165,20 +165,17 @@ fi
 STAGE=4
 log "running sweep matrix on $HEAD_TRAY"
 SWEEP_TAG="deepep_sweep_$RUN_ID"
-"${JSSH[@]}" "fizhang@$HEAD_TRAY" \
-  DEEPEP_DIR="$DEEPEP_DIR" \
-  NCCL_ROOT_DIR="$NCCL_ROOT_DIR" \
-  DEEPEP_LOG_DIR="$DEEPEP_LOG_DIR" \
-  TRAYS="$TRAYS" \
-  SWEEP_TAG="$SWEEP_TAG" \
-  PYTHON_BIN="${PYTHON_BIN:-}" \
-  EP_SIZES="${EP_SIZES:-4 8 16}" \
-  TOKENS="${TOKENS:-1024 2048 4096 8192}" \
-  TOPK_EXPERTS="${TOPK_EXPERTS:-8:256 6:256}" \
-  FP8="${FP8:-1}" \
-  EXTRA_ARGS="${EXTRA_ARGS:-}" \
-  bash -l "$DEEPEP_DIR/scripts/tray_deepep_sweep.sh" 2>&1 \
-  | sed 's/^/    /'
+# SSH joins argv with spaces on the remote side, so values containing spaces
+# (TRAYS="a b c d", EP_SIZES="4 8 16", EXTRA_ARGS="--foo --bar", ...) get
+# torn apart and treated as separate commands. Pack everything into a single
+# remote shell string with explicit single-quoting.
+"${JSSH[@]}" "fizhang@$HEAD_TRAY" bash -l -c "$(
+  printf "DEEPEP_DIR=%q NCCL_ROOT_DIR=%q DEEPEP_LOG_DIR=%q TRAYS=%q SWEEP_TAG=%q PYTHON_BIN=%q EP_SIZES=%q TOKENS=%q TOPK_EXPERTS=%q FP8=%q EXTRA_ARGS=%q bash -l %q" \
+    "$DEEPEP_DIR" "$NCCL_ROOT_DIR" "$DEEPEP_LOG_DIR" "$TRAYS" "$SWEEP_TAG" \
+    "${PYTHON_BIN:-}" "${EP_SIZES:-4 8 16}" "${TOKENS:-1024 2048 4096 8192}" \
+    "${TOPK_EXPERTS:-8:256 6:256}" "${FP8:-1}" "${EXTRA_ARGS:-}" \
+    "$DEEPEP_DIR/scripts/tray_deepep_sweep.sh"
+)" 2>&1 | sed 's/^/    /'
 
 #==============================================================================
 # [5/6] Pull logs back to jumphost
