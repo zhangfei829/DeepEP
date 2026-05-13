@@ -105,13 +105,20 @@ _collect_python_candidates() {
     [ -x "$venv_root/bin/$pyver" ]  && out+=("$venv_root/bin/$pyver")
   done
 
-  # Shotgun: any python3 under common roots (no enroot).
+  # Shotgun: any python3 under common roots (no enroot). Restrict basename
+  # to real interpreter names: python, python3, python3.X (no -config,
+  # -unidiff, -pip, -pyvenv junk).
   for p in $(find "${search_roots[@]}" -maxdepth 8 -name 'python3*' -type f -executable 2>/dev/null \
-              | grep -v '/enroot/data/' | head -50); do
+              | grep -v '/enroot/data/' \
+              | grep -E '/(python|python3|python3\.[0-9]+)$' \
+              | head -50); do
     out+=("$p")
   done
 
-  printf '%s\n' "${out[@]}" | awk '!seen[$0]++'
+  # Filter all collected candidates by basename to drop python3.12-config etc.
+  printf '%s\n' "${out[@]}" \
+    | grep -E '/(python|python3|python3\.[0-9]+)$' \
+    | awk '!seen[$0]++'
 }
 
 # Try `import torch` directly on $1. If it fails, fall back to injecting
@@ -123,6 +130,11 @@ _check_python() {
   local py="$1"
   _CHECK_PY_PATH=""
   _CHECK_PY_TVER=""
+  # Sanity: must actually behave like a python interpreter. Things like
+  # python3.12-config or python3-unidiff don't accept `-c '...'`; they print
+  # their own usage banner to stdout *and* exit 0 on some distros, fooling
+  # any string-based probe. A real interpreter accepts `import sys`.
+  "$py" -c 'import sys' >/dev/null 2>&1 || return 1
   local tver
   tver=$("$py" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
   if [ -n "$tver" ]; then

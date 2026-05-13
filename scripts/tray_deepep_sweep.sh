@@ -83,14 +83,19 @@ _collect_python_candidates() {
     [ -x "$venv_root/bin/$pyver" ]  && out+=("$venv_root/bin/$pyver")
   done
   for p in $(find "${search_roots[@]}" -maxdepth 8 -name 'python3*' -type f -executable 2>/dev/null \
-              | grep -v '/enroot/data/' | head -50); do
+              | grep -v '/enroot/data/' \
+              | grep -E '/(python|python3|python3\.[0-9]+)$' \
+              | head -50); do
     out+=("$p")
   done
-  printf '%s\n' "${out[@]}" | awk '!seen[$0]++'
+  printf '%s\n' "${out[@]}" \
+    | grep -E '/(python|python3|python3\.[0-9]+)$' \
+    | awk '!seen[$0]++'
 }
 _check_python() {
   local py="$1"
   _CHECK_PY_PATH=""; _CHECK_PY_TVER=""
+  "$py" -c 'import sys' >/dev/null 2>&1 || return 1
   local tver
   tver=$("$py" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)
   if [ -n "$tver" ]; then _CHECK_PY_TVER="$tver"; return 0; fi
