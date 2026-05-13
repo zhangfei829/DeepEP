@@ -347,6 +347,39 @@ fi
 ln -sf "../$so_file" "deep_ep/$(basename "$so_file")"
 log "linked $so_file -> deep_ep/$(basename "$so_file")"
 
+# ----- patch PyTorch wheel NCCL to match user-built NCCL ---------------------
+# DeepEP's `check_nccl_so()` (in deep_ep/__init__.py) asserts that the NCCL
+# .so loaded by torch.cuda.nccl (typically the one bundled in the wheel under
+# nvidia/nccl/lib/) is *byte-identical* to the NCCL we linked DeepEP against
+# (NCCL_ROOT_DIR). A pip-installed torch usually ships libnccl.so.2 from
+# nvidia-nccl-cu13 (2.29.x), which mismatches our user-built NCCL >=2.30 with
+# Gin backend. Symlink-swap the wheel copy to the user-built one so torch
+# and DeepEP share the exact same NCCL at runtime.
+log "patching PyTorch wheel NCCL -> $NCCL_ROOT_DIR"
+PT_NCCL_DIR=$("$PYTHON_BIN" - <<'PY' 2>/dev/null || true
+try:
+    import nvidia.nccl, os
+    print(os.path.join(os.path.dirname(nvidia.nccl.__file__), 'lib'))
+except Exception:
+    pass
+PY
+)
+USER_NCCL_SO=$(ls -1 "$NCCL_ROOT_DIR"/lib/libnccl.so.2.* 2>/dev/null | head -1)
+if [ -z "$USER_NCCL_SO" ]; then
+  USER_NCCL_SO=$(readlink -f "$NCCL_ROOT_DIR/lib/libnccl.so" 2>/dev/null || true)
+fi
+if [ -n "$PT_NCCL_DIR" ] && [ -d "$PT_NCCL_DIR" ] && [ -n "$USER_NCCL_SO" ] && [ -f "$USER_NCCL_SO" ]; then
+  if [ -f "$PT_NCCL_DIR/libnccl.so.2" ] && [ ! -L "$PT_NCCL_DIR/libnccl.so.2" ]; then
+    mv -f "$PT_NCCL_DIR/libnccl.so.2" "$PT_NCCL_DIR/libnccl.so.2.wheel-orig" 2>/dev/null || true
+  fi
+  ln -sf "$USER_NCCL_SO" "$PT_NCCL_DIR/libnccl.so.2"
+  log "  PT_NCCL_DIR    = $PT_NCCL_DIR"
+  log "  USER_NCCL_SO   = $USER_NCCL_SO"
+  log "  ln -sf $(readlink "$PT_NCCL_DIR/libnccl.so.2")"
+else
+  log "  skipped (PT_NCCL_DIR='$PT_NCCL_DIR' USER_NCCL_SO='$USER_NCCL_SO')"
+fi
+
 # ----- smoke: import + NCCL version -----------------------------------------
 log "smoke: import deep_ep (this also triggers NCCL/library probes)"
 EP_BUFFER_DEBUG=1 "$PYTHON_BIN" - <<'PY'
