@@ -258,7 +258,7 @@ def print_markdown(runs, summaries, metas):
     def hdr(name, w):
         return f' {name:<{w}} '
 
-    W_WARPS = 22  # "4 notify + 8 dispatch"
+    W_WARPS = 16  # "12=4n+4s+4f" hybrid worst case
     header = (
         '|' + hdr('EP', 2)
         + '|' + hdr('tokens', 6)
@@ -267,7 +267,7 @@ def print_markdown(runs, summaries, metas):
         + '|' + hdr('exp/rank', 8)
         + '|' + hdr('SMs', 4)
         + '|' + hdr('op', 8)
-        + '|' + hdr('warps/block (breakdown)', W_WARPS)
+        + '|' + hdr('warps/blk', W_WARPS)
         + '|' + hdr('kernel Scale-Up GB/s', W_SU)
         + '|' + hdr('kernel us', W_US)
         + '|' + hdr('copy GB/s', W_COPY)
@@ -291,14 +291,22 @@ def print_markdown(runs, summaries, metas):
             exp_per_rank = 0
         num_sms = meta.get('num_sms', '?')
         warps_meta = meta.get('warps', {}) or {}
+
+        def _short_breakdown(b: str) -> str:
+            # "4 notify + 8 dispatch" -> "4n+8d"; same for scaleout/forward/warps
+            short_map = (('notify', 'n'), ('dispatch', 'd'), ('scaleout', 's'),
+                         ('forward', 'f'), ('warps', 'w'))
+            out = b
+            for long, s in short_map:
+                out = out.replace(' ' + long, s)
+            return out.replace(' ', '')
+
         for op in SUMMARY_OPS:
-            # Pick the matching kernel warp record. `dispatch` op covers both
-            # plain dispatch_impl and hybrid_dispatch_impl.
             if op == 'dispatch':
                 w = warps_meta.get('hybrid_dispatch') or warps_meta.get('dispatch')
             else:
                 w = warps_meta.get('combine')
-            warps_cell = f'{w["total"]} ({w["breakdown"]})' if w else '?'
+            warps_cell = f'{w["total"]}={_short_breakdown(w["breakdown"])}' if w else '?'
 
             s = summary.get(op)
             if s is None:
