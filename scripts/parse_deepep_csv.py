@@ -202,32 +202,94 @@ def print_markdown(runs, summaries):
 
     rows.sort(key=key)
     print()
-    # Header. API columns (host wall-time) follow the kernel-time columns,
-    # mirroring the Hybrid_ep / NCCL EP statistic layout (kernel | API).
-    print('| EP | tokens | topk | exp | op       | SO GB/s (min/avg/max) | SU GB/s (min/avg/max) | time us (min/avg/max) | copy GB/s | api SU GB/s (min/avg/max) | api time us (min/avg/max) |')
-    print('|----|--------|------|-----|----------|-----------------------|-----------------------|-----------------------|-----------|---------------------------|---------------------------|')
+    # Legend
+    print('Legend:')
+    print('  SO     = Scale-Out  bandwidth (cross-NVL72 RDMA);   0 GB/s when all ranks fit in one NVLink domain')
+    print('  SU     = Scale-Up   bandwidth (intra-NVL72 NVLink); GB/s = scaleup_recv_bytes / time')
+    print('  kernel = device-only time from kineto (CUDA kernel duration); GB/s = bytes / kernel_us')
+    print('  api    = end-to-end host wall time (Python call + kernel launch + sync), comparable to Hybrid_ep / NCCL EP "API GB/s"; GB/s = bytes / api_us')
+    print('  cells  = min / avg / max aggregated across all ranks in the run')
+    print()
+
+    # Column widths chosen so cell + header are equal length -> aligned in
+    # both monospace renderers and Markdown viewers.
+    W_SO       = 17   # "0 /   0.0 /   0"
+    W_SU       = 21   # "486 / 489.5 / 496"
+    W_US       = 24   # " 27.97 /  28.24 /  28.45"
+    W_COPY     = 9    #  "4607.8 "
+    W_API_BW   = 21   #  for api SO, api SU
+    W_API_US   = 24
+
+    def hdr(name, w):
+        return f' {name:<{w}} '
+
+    header = (
+        '|' + hdr('EP', 2)
+        + '|' + hdr('tokens', 6)
+        + '|' + hdr('topk', 4)
+        + '|' + hdr('exp', 3)
+        + '|' + hdr('op', 8)
+        + '|' + hdr('kernel SO GB/s', W_SO)
+        + '|' + hdr('kernel SU GB/s', W_SU)
+        + '|' + hdr('kernel us', W_US)
+        + '|' + hdr('copy GB/s', W_COPY)
+        + '|' + hdr('api SO GB/s', W_API_BW)
+        + '|' + hdr('api SU GB/s', W_API_BW)
+        + '|' + hdr('api us', W_API_US)
+        + '|'
+    )
+    sep = '|' + '|'.join('-' * (len(c)) for c in header[1:-1].split('|')) + '|'
+    print(header)
+    print(sep)
+
+    def fmt_triple(lo, avg, hi, fmt='>5.1f'):
+        return f'{lo:>5.1f} / {avg:{fmt}} / {hi:>5.1f}' if isinstance(lo, float) else f'{lo:>5} / {avg:>5.1f} / {hi:>5}'
+
     for run, summary in rows:
         for op in SUMMARY_OPS:
             s = summary.get(op)
             if s is None:
-                print(f'| {run.get("ep","?"):>2} | {run.get("tokens","?"):>6} | '
-                      f'{run.get("topk","?"):>4} | {run.get("experts","?"):>3} | '
-                      f'{op:<8} | (no data)              |                       |                       |           |                           |                           |')
+                cells = ['(no data)'] * 7
+                row = (
+                    '|' + f' {str(run.get("ep","?")):>2} '
+                    + '|' + f' {str(run.get("tokens","?")):>6} '
+                    + '|' + f' {str(run.get("topk","?")):>4} '
+                    + '|' + f' {str(run.get("experts","?")):>3} '
+                    + '|' + f' {op:<8} '
+                    + ''.join('|' + f' {c:<{w}} ' for c, w in zip(cells, (W_SO, W_SU, W_US, W_COPY, W_API_BW, W_API_BW, W_API_US)))
+                    + '|'
+                )
+                print(row)
                 continue
+
+            so_cell  = f'{s["so_min"]:>3} / {s["so_avg"]:>5.1f} / {s["so_max"]:>3}'
+            su_cell  = f'{s["su_min"]:>3} / {s["su_avg"]:>5.1f} / {s["su_max"]:>3}'
+            us_cell  = f'{s["us_min"]:>6.2f} / {s["us_avg"]:>6.2f} / {s["us_max"]:>6.2f}'
+            cp_cell  = f'{s["copy_gbs_avg"]:>6.1f}'
+
             if 'api_us_avg' in s:
-                api_su = f'{s["api_su_min"]:>3} / {s["api_su_avg"]:>5.1f} / {s["api_su_max"]:>3}'
-                api_us = f'{s["api_us_min"]:>6.2f} / {s["api_us_avg"]:>6.2f} / {s["api_us_max"]:>6.2f}'
+                api_so_cell = f'{s["api_so_min"]:>3} / {s["api_so_avg"]:>5.1f} / {s["api_so_max"]:>3}'
+                api_su_cell = f'{s["api_su_min"]:>3} / {s["api_su_avg"]:>5.1f} / {s["api_su_max"]:>3}'
+                api_us_cell = f'{s["api_us_min"]:>6.2f} / {s["api_us_avg"]:>6.2f} / {s["api_us_max"]:>6.2f}'
             else:
-                api_su = '(no data)'
-                api_us = '(no data)'
-            print(
-                f'| {run.get("ep",""):>2} | {run.get("tokens",""):>6} | {run.get("topk",""):>4} | {run.get("experts",""):>3} | '
-                f'{op:<8} | '
-                f'{s["so_min"]:>3} / {s["so_avg"]:>5.1f} / {s["so_max"]:>3} | '
-                f'{s["su_min"]:>3} / {s["su_avg"]:>5.1f} / {s["su_max"]:>3} | '
-                f'{s["us_min"]:>6.2f} / {s["us_avg"]:>6.2f} / {s["us_max"]:>6.2f} | '
-                f'{s["copy_gbs_avg"]:>6.1f}    | '
-                f'{api_su:<25} | {api_us:<25} |')
+                api_so_cell = api_su_cell = api_us_cell = '(no data)'
+
+            row = (
+                '|' + f' {str(run.get("ep","")):>2} '
+                + '|' + f' {str(run.get("tokens","")):>6} '
+                + '|' + f' {str(run.get("topk","")):>4} '
+                + '|' + f' {str(run.get("experts","")):>3} '
+                + '|' + f' {op:<8} '
+                + '|' + f' {so_cell:<{W_SO}} '
+                + '|' + f' {su_cell:<{W_SU}} '
+                + '|' + f' {us_cell:<{W_US}} '
+                + '|' + f' {cp_cell:<{W_COPY}} '
+                + '|' + f' {api_so_cell:<{W_API_BW}} '
+                + '|' + f' {api_su_cell:<{W_API_BW}} '
+                + '|' + f' {api_us_cell:<{W_API_US}} '
+                + '|'
+            )
+            print(row)
 
 
 def main():
