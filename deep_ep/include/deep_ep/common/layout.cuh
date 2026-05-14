@@ -360,44 +360,47 @@ struct CompactRecvBufferLayout {
         return num_max_tokens_per_rank * num_ranks;
     }
 
+    // math::align<T>(T,T) requires both args the same type; force int64_t.
     __forceinline__ __device__ __host__
     int64_t get_region_A_bytes() const {
-        return math::align(get_max_tokens() * hidden_bytes, ptx::kNumTMAAlignBytes);
+        return math::align<int64_t>(get_max_tokens() * hidden_bytes,
+                                    static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
     __forceinline__ __device__ __host__
     int64_t get_region_B_bytes() const {
-        return math::align(get_max_tokens() * sf_bytes_per_token, ptx::kNumTMAAlignBytes);
+        return math::align<int64_t>(get_max_tokens() * sf_bytes_per_token,
+                                    static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
     __forceinline__ __device__ __host__
     int64_t get_region_C_bytes() const {
-        return math::align(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(int)),
-                           ptx::kNumTMAAlignBytes);
+        return math::align<int64_t>(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(int)),
+                                    static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
     __forceinline__ __device__ __host__
     int64_t get_region_D_bytes() const {
-        return math::align(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(float)),
-                           ptx::kNumTMAAlignBytes);
+        return math::align<int64_t>(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(float)),
+                                    static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
     __forceinline__ __device__ __host__
     int64_t get_region_E_bytes() const {
-        return math::align(get_max_tokens() * (num_topk + 2) * static_cast<int64_t>(sizeof(int)),
-                           ptx::kNumTMAAlignBytes);
+        return math::align<int64_t>(get_max_tokens() * (num_topk + 2) * static_cast<int64_t>(sizeof(int)),
+                                    static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
     __forceinline__ __device__ __host__
     int64_t get_region_F_bytes() const {
-        return math::align(num_ranks * static_cast<int64_t>(sizeof(int)),
-                           ptx::kNumTMAAlignBytes);
+        return math::align<int64_t>(num_ranks * static_cast<int64_t>(sizeof(int)),
+                                    static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
     __forceinline__ __device__ __host__
     int64_t get_region_G_bytes() const {
-        return math::align(num_ranks * num_ranks * static_cast<int64_t>(sizeof(int)),
-                           ptx::kNumTMAAlignBytes);
+        return math::align<int64_t>(num_ranks * num_ranks * static_cast<int64_t>(sizeof(int)),
+                                    static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
     __forceinline__ __device__ __host__
