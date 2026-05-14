@@ -214,6 +214,18 @@ public:
                                           &compact_window, NCCL_WIN_DEFAULT));
         NCCL_CHECK(ncclGetLsaDevicePointer(compact_window, 0, nccl_context->nvl_rank_idx, &compact_mapped_ptr));
 
+        // CRITICAL: query LSA device pointer for EVERY peer in the NVL domain.
+        // This is what actually establishes the P2P mapping on the local GPU;
+        // without it, a remote rank's write into this window from NVLink P2P
+        // lands at an address that is not P2P-accessible on this GPU and
+        // triggers CUDA_ERROR_ILLEGAL_ADDRESS later (during next CUDA call).
+        // (The legacy `nccl_window` does this in NCCLSymmetricMemoryContext.)
+        for (int i = 0; i < nccl_context->num_nvl_ranks; ++ i) {
+            void* tmp_peer_ptr;
+            NCCL_CHECK(ncclGetLsaDevicePointer(compact_window, 0, i, &tmp_peer_ptr));
+            (void)tmp_peer_ptr;
+        }
+
         // Cache config.
         compact_n_max               = n_max;
         compact_hidden_bytes        = hidden_bytes;
