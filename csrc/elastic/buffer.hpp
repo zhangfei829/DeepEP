@@ -783,6 +783,15 @@ public:
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
              const bool& use_tma_aligned_col_major_sf) const {
+        static thread_local int call_count = 0;
+        ++ call_count;
+        if (nccl_context->rank_idx == 0)
+            fprintf(stderr, "[dispatch:dbg] call #%d cached=%d do_expand=%d do_cpu_sync=%d sf=%d\n",
+                    call_count, static_cast<int>(cached_num_recv_tokens.has_value()),
+                    static_cast<int>(do_expand), static_cast<int>(do_cpu_sync),
+                    static_cast<int>(sf.has_value()));
+        fflush(stderr);
+
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 

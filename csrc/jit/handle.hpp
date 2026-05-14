@@ -83,6 +83,8 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
                                LibraryHandle *library_opt = nullptr) {
     LibraryHandle library;
     KernelHandle kernel;
+    fprintf(stderr, "[jit:dbg] cuModuleLoad path=%s func=%s\n", cubin_path.c_str(), func_name.c_str());
+    fflush(stderr);
     CUDA_DRIVER_CHECK(lazy_cuModuleLoad(&library, cubin_path.c_str()));
     CUDA_DRIVER_CHECK(lazy_cuModuleGetFunction(&kernel, library, func_name.c_str()));
 
