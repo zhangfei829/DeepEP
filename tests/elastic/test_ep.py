@@ -517,27 +517,29 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             expanded_recv_topk_weights = expanded_recv_topk_weights[expanded_safe_indices]
 
             # Cached checks
-            if buffer.rank_idx == 0:
-                print(f'  [fp:hdl] handle.psum={handle.psum_num_recv_tokens_per_scaleup_rank.tolist()}')
-                print(f'  [fp:hdl] cached.psum={cached_handle.psum_num_recv_tokens_per_scaleup_rank.tolist()}')
-                print(f'  [fp:hdl] handle.dst_buf_slot[0:3]={handle.dst_buffer_slot_idx[0:3].tolist()}')
-                print(f'  [fp:hdl] cached.dst_buf_slot[0:3]={cached_handle.dst_buffer_slot_idx[0:3].tolist()}')
-                print(f'  [fp:hdl] handle.num_recv={num_recv_tokens} cached.num_recv={cached_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()}')
+            import sys
+            def _p(msg):
+                if buffer.rank_idx == 0:
+                    sys.stderr.write(msg + '\n'); sys.stderr.flush()
+            _p(f'  [fp:hdl] handle.psum={handle.psum_num_recv_tokens_per_scaleup_rank.tolist()}')
+            _p(f'  [fp:hdl] cached.psum={cached_handle.psum_num_recv_tokens_per_scaleup_rank.tolist()}')
+            _p(f'  [fp:hdl] handle.dst_buf_slot[0:3]={handle.dst_buffer_slot_idx[0:3].tolist()}')
+            _p(f'  [fp:hdl] cached.dst_buf_slot[0:3]={cached_handle.dst_buffer_slot_idx[0:3].tolist()}')
+            _p(f'  [fp:hdl] handle.num_recv={num_recv_tokens} cached.num_recv={cached_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()}')
 
             def _dbg_diff(a, b, name):
                 if not torch.equal(a, b):
-                    if buffer.rank_idx == 0:
-                        ne = (a != b)
-                        if ne.dim() > 1:
-                            row_mask = ne.any(dim=tuple(range(1, ne.dim())))
-                        else:
-                            row_mask = ne
-                        mm_rows = row_mask.nonzero().squeeze(-1)[:10].tolist()
-                        print(f'  [fp:diff] {name} shape={tuple(a.shape)} mismatch rows (first 10): {mm_rows}')
-                        if a.dtype in (torch.bfloat16, torch.float16, torch.float32, torch.uint8):
-                            print(f'  [fp:diff] {name} max|a-b|={ (a.float() - b.float()).abs().max().item() }')
-                        for r in mm_rows[:3]:
-                            print(f'  [fp:diff] {name} row {r}: a[:8]={a[r].flatten()[:8].tolist()} b[:8]={b[r].flatten()[:8].tolist()}')
+                    ne = (a != b)
+                    if ne.dim() > 1:
+                        row_mask = ne.any(dim=tuple(range(1, ne.dim())))
+                    else:
+                        row_mask = ne
+                    mm_rows = row_mask.nonzero().squeeze(-1)[:10].tolist()
+                    _p(f'  [fp:diff] {name} shape={tuple(a.shape)} mismatch rows (first 10): {mm_rows}')
+                    if a.dtype in (torch.bfloat16, torch.float16, torch.float32, torch.uint8):
+                        _p(f'  [fp:diff] {name} max|a-b|={ (a.float() - b.float()).abs().max().item() }')
+                    for r in mm_rows[:3]:
+                        _p(f'  [fp:diff] {name} row {r}: a[:8]={a[r].flatten()[:8].tolist()} b[:8]={b[r].flatten()[:8].tolist()}')
                     return False
                 return True
 
