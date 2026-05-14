@@ -234,11 +234,6 @@ public:
     }
 
     // Fast-path eligibility.
-    // NOTE: fast-path kernel is WORK-IN-PROGRESS. Even with DEEPEP_FAST_PATH=1
-    // we currently fall through to the legacy dispatch path because the kernel
-    // hits illegal-address bugs (Gin LSA pointer / arrival counter race) that
-    // need more design work on real hardware. To re-enable the fast path,
-    // change the `return false` below to remove the gate.
     bool is_fast_path_dispatch(const bool& do_expand,
                                const bool& cached_mode,
                                const bool& is_deterministic_flag) const {
@@ -248,9 +243,7 @@ public:
         if (cached_mode) return false;
         if (is_deterministic_flag) return false;
         if (nccl_context->num_scaleout_ranks != 1) return false;
-        // TEMPORARY: gate off fast path until kernel correctness is verified.
-        // Re-enable by deleting the following line.
-        return false;
+        return true;
     }
 
     void destroy_compact_recv_window() const {
