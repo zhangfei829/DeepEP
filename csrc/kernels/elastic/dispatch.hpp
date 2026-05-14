@@ -436,6 +436,16 @@ static void launch_dispatch_fast_path(void* x, void* sf,
         math::ceil_div(512, num_sms));
     const int num_threads = (num_notify_warps + num_dispatch_warps) * 32;
 
+    // Fast-path kernel actually uses very little dynamic smem (NOTIFY ~1 KB
+    // + a small per-block compact base cache). Request just enough; passing
+    // the full SM smem capacity makes cuFuncSetAttribute report
+    // CUDA_ERROR_INVALID_VALUE on GB300 (sm_103) for kernels not compiled
+    // with -rdc=true.
+    const int fast_path_smem_bytes = std::min<int>(
+        num_smem_bytes,
+        /*notify_smem_bytes*/ num_notify_smem_bytes + /*compact_base*/ 64
+            + /*reserved alignment*/ 4096);
+
     const DispatchFastPathRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync       = do_cpu_sync,
@@ -461,7 +471,7 @@ static void launch_dispatch_fast_path(void* x, void* sf,
         .rank_idx = rank_idx,
         .compact_buffer = compact_buffer,
         .compact_window = compact_window,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes,
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, fast_path_smem_bytes,
                                        2 - (num_sms % 2), true)};
     const auto code = DispatchFastPathRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch_fast_path", code);
