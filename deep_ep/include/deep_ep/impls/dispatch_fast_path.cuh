@@ -323,6 +323,17 @@ dispatch_impl_fast_path(
                 gin_compact.put_value<team_t>(dst_psum_slot, psum_val_exclusive + 1, i,
                                               ncclGinOptFlagsAggregateRequests);
             }
+
+            // Make NVLink writes visible.
+            __threadfence_system();
+            __syncwarp();
+
+            // Self-write sanity check: rank 0 reads back its own broadcast to itself.
+            if (rank_idx == 0 and thread_idx == 0) {
+                int* self_slot = compact_layout.peer_psum_ptr(/*dst=*/0, /*src=*/0);
+                const int v = ptx::ld_volatile<int>(self_slot);
+                printf("[fp] rank0 self-broadcast check: G[0][0] = %d (expected 1)\n", v);
+            }
             __syncwarp();
         }
     }
@@ -359,10 +370,16 @@ dispatch_impl_fast_path(
         if (thread_idx < kNumRanks) {
             int* slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/thread_idx,
                                                       /*src_rank_idx=*/rank_idx);
-            int v;
-            do {
+            int v = 0;
+            const auto t0 = clock64();
+            while (v == 0) {
                 v = ptx::ld_volatile<int>(slot);
-            } while (v == 0);
+                if (clock64() - t0 > kNumTimeoutCycles) {
+                    printf("[fp:ERR] rank=%d sm=%d wait_psum from dst=%d TIMEOUT (slot=%p)\n",
+                           rank_idx, sm_idx, thread_idx, slot);
+                    return;  // bail out (kernel exit), avoids hang
+                }
+            }
             s_my_compact_base[thread_idx] = v - 1;
         }
         __syncthreads();
