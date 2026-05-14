@@ -130,7 +130,8 @@ def _maybe_print_kernel_warps_metadata(printed: dict):
 def enumerate_ep_modes():
     for do_handle_copy in (1, 0):
         for expert_alignment in (128, 1):
-            for use_fp8_dispatch in (1, 0):
+            # Run BF16 (no sf) first to isolate hidden vs sf bugs in fast-path.
+            for use_fp8_dispatch in (0, 1):
                 for num_bias in (0, 1, 2):
                     for with_previous_event in (0, 1):
                         for async_with_compute_stream in (0, 1):
