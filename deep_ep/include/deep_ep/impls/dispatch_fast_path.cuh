@@ -295,11 +295,12 @@ dispatch_impl_fast_path(
             // local Region G is written by each remote peer, providing this rank with
             // its compact base offset on each dst.
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
-                const auto dst_psum_slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/rank_idx,
-                                                                         /*src_rank_idx=*/i);
-                gin.put_value<team_t>(dst_psum_slot,
-                                      static_cast<int64_t>(psum_num_recv_tokens_per_scaleup_rank[i]),
-                                      i,
+                int* dst_psum_slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/rank_idx,
+                                                                  /*src_rank_idx=*/i);
+                // dtype_t deduced from sym_ptr (int*); value must be int too,
+                // not int64_t, otherwise template deduction conflicts.
+                const int psum_val = psum_num_recv_tokens_per_scaleup_rank[i];
+                gin.put_value<team_t>(dst_psum_slot, psum_val, i,
                                       ncclGinOptFlagsAggregateRequests);
             }
             __syncwarp();
