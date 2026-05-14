@@ -133,6 +133,10 @@ dispatch_impl_fast_path(
                       comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
+    if (sm_idx == 0 and thread_idx == 0 and rank_idx == 0)
+        printf("[fp] kernel entered, num_tokens=%d, kNumRanks=%d, kNumSMs=%d\n",
+               num_tokens, kNumRanks, kNumSMs);
+
     // -----------------------------------------------------------------------
     // PHASE 1: NOTIFY (only the first kNumNotifyWarps warps participate).
     // This is intentionally identical to the legacy NOTIFY phase, since
@@ -302,6 +306,9 @@ dispatch_impl_fast_path(
             // Equivalent recv-side: peer_psum_row_ptr(dst_rank=rank_idx) of this rank's
             // local Region G is written by each remote peer, providing this rank with
             // its compact base offset on each dst.
+            if (rank_idx == 0 and thread_idx == 0)
+                printf("[fp] entering psum broadcast, rank_idx=%d\n", rank_idx);
+
             // dst (this rank) broadcasts its exclusive psum into every peer's
             // peer_psum_buf row [dst_rank_idx=rank_idx][src_rank_idx=*].
             // Encoding: store (psum_val + 1) so 0 means "not arrived yet";
@@ -328,6 +335,9 @@ dispatch_impl_fast_path(
     // remote dst already wrote (psum_val + 1) into this slot.
     // -----------------------------------------------------------------------
     __syncthreads();  // local barrier so warps don't race on the wait below
+
+    if (sm_idx == 0 and thread_idx == 0 and rank_idx == 0)
+        printf("[fp] phase 1.5 spin-wait peer_psum, rank_idx=%d\n", rank_idx);
 
     // -----------------------------------------------------------------------
     // PHASE 2: ALL warps do compact DISPATCH.
@@ -356,6 +366,12 @@ dispatch_impl_fast_path(
             s_my_compact_base[thread_idx] = v - 1;
         }
         __syncthreads();
+
+        if (sm_idx == 0 and thread_idx == 0 and rank_idx == 0) {
+            printf("[fp] phase 2 start, my_compact_base[0..3]=%d,%d,%d,%d\n",
+                   s_my_compact_base[0], s_my_compact_base[1],
+                   s_my_compact_base[2], s_my_compact_base[3]);
+        }
 
         // Token stride: each warp picks tokens at (warp_idx * kNumSMs + sm_idx + k * total_warps * kNumSMs).
         const auto total_warps = kNumThreads / 32;
