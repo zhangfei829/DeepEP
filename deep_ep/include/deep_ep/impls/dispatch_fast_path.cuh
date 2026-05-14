@@ -321,8 +321,14 @@ dispatch_impl_fast_path(
     // -----------------------------------------------------------------------
     __syncthreads();
 
-    // Load my row of peer_psum into shared memory once per block.
-    __shared__ int s_my_compact_base[kNumRanks];
+    // Reuse the NOTIFY counter region of dynamic smem (no longer used after
+    // phase 1) for the per-block compact_base cache.  Avoids adding any
+    // static __shared__ allocation that would push us over the per-block
+    // smem limit when cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) is
+    // already requesting the device max.
+    int* const s_my_compact_base = reinterpret_cast<int*>(smem);
+    EP_STATIC_ASSERT(kNumRanks * static_cast<int>(sizeof(int)) <= kNumSmemBytesForNotify,
+                     "compact_base cache must fit in notify smem region");
     if (thread_idx < kNumRanks) {
         int* slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/thread_idx,
                                                   /*src_rank_idx=*/rank_idx);
