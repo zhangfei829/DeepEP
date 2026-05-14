@@ -395,7 +395,10 @@ except Exception:
     pass
 PY
 )
-USER_NCCL_SO=$(ls -1 "$NCCL_ROOT_DIR"/lib/libnccl.so.2.* 2>/dev/null | head -1)
+# `set -euo pipefail` is active; if there's no matching file, `ls | head`
+# returns non-zero and kills the whole build. Wrap with `|| true` to keep
+# USER_NCCL_SO as an empty string (the if-block below already handles that).
+USER_NCCL_SO=$(ls -1 "$NCCL_ROOT_DIR"/lib/libnccl.so.2.* 2>/dev/null | head -1 || true)
 if [ -z "$USER_NCCL_SO" ]; then
   USER_NCCL_SO=$(readlink -f "$NCCL_ROOT_DIR/lib/libnccl.so" 2>/dev/null || true)
 fi
