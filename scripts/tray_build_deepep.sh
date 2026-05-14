@@ -403,13 +403,26 @@ if [ -z "$USER_NCCL_SO" ]; then
   USER_NCCL_SO=$(readlink -f "$NCCL_ROOT_DIR/lib/libnccl.so" 2>/dev/null || true)
 fi
 if [ -n "$PT_NCCL_DIR" ] && [ -d "$PT_NCCL_DIR" ] && [ -n "$USER_NCCL_SO" ] && [ -f "$USER_NCCL_SO" ]; then
-  if [ -f "$PT_NCCL_DIR/libnccl.so.2" ] && [ ! -L "$PT_NCCL_DIR/libnccl.so.2" ]; then
-    mv -f "$PT_NCCL_DIR/libnccl.so.2" "$PT_NCCL_DIR/libnccl.so.2.wheel-orig" 2>/dev/null || true
+  # When NCCL_ROOT_DIR points at the PyPI wheel itself (PT_NCCL_DIR), the
+  # "user-built NCCL" *is* the wheel NCCL. There's nothing to patch; touching
+  # libnccl.so.2 here would create a self-referential dangling symlink and
+  # break `import torch` with "undefined symbol: ncclCommResume" because the
+  # link would resolve to the now-renamed .wheel-orig file.
+  USER_NCCL_REAL=$(readlink -f "$USER_NCCL_SO" 2>/dev/null || echo "$USER_NCCL_SO")
+  PT_NCCL_REAL=$(readlink -f "$PT_NCCL_DIR/libnccl.so.2" 2>/dev/null || echo "")
+  if [ "$USER_NCCL_REAL" = "$PT_NCCL_REAL" ] || [ "$(dirname "$USER_NCCL_REAL")" = "$PT_NCCL_DIR" ]; then
+    log "  skipped (NCCL_ROOT_DIR is already the PyTorch wheel NCCL; no patch needed)"
+    log "  PT_NCCL_DIR    = $PT_NCCL_DIR"
+    log "  USER_NCCL_SO   = $USER_NCCL_SO"
+  else
+    if [ -f "$PT_NCCL_DIR/libnccl.so.2" ] && [ ! -L "$PT_NCCL_DIR/libnccl.so.2" ]; then
+      mv -f "$PT_NCCL_DIR/libnccl.so.2" "$PT_NCCL_DIR/libnccl.so.2.wheel-orig" 2>/dev/null || true
+    fi
+    ln -sf "$USER_NCCL_SO" "$PT_NCCL_DIR/libnccl.so.2"
+    log "  PT_NCCL_DIR    = $PT_NCCL_DIR"
+    log "  USER_NCCL_SO   = $USER_NCCL_SO"
+    log "  ln -sf $(readlink "$PT_NCCL_DIR/libnccl.so.2")"
   fi
-  ln -sf "$USER_NCCL_SO" "$PT_NCCL_DIR/libnccl.so.2"
-  log "  PT_NCCL_DIR    = $PT_NCCL_DIR"
-  log "  USER_NCCL_SO   = $USER_NCCL_SO"
-  log "  ln -sf $(readlink "$PT_NCCL_DIR/libnccl.so.2")"
 else
   log "  skipped (PT_NCCL_DIR='$PT_NCCL_DIR' USER_NCCL_SO='$USER_NCCL_SO')"
 fi
