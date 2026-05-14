@@ -517,6 +517,13 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             expanded_recv_topk_weights = expanded_recv_topk_weights[expanded_safe_indices]
 
             # Cached checks
+            if buffer.rank_idx == 0:
+                print(f'  [fp:hdl] handle.psum={handle.psum_num_recv_tokens_per_scaleup_rank.tolist()}')
+                print(f'  [fp:hdl] cached.psum={cached_handle.psum_num_recv_tokens_per_scaleup_rank.tolist()}')
+                print(f'  [fp:hdl] handle.dst_buf_slot[0:3]={handle.dst_buffer_slot_idx[0:3].tolist()}')
+                print(f'  [fp:hdl] cached.dst_buf_slot[0:3]={cached_handle.dst_buffer_slot_idx[0:3].tolist()}')
+                print(f'  [fp:hdl] handle.num_recv={num_recv_tokens} cached.num_recv={cached_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()}')
+
             def _dbg_diff(a, b, name):
                 if not torch.equal(a, b):
                     if buffer.rank_idx == 0:
@@ -534,15 +541,18 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     return False
                 return True
 
+            # Run cheap handle checks first so we can see which level diverges.
+            _ok_psum = _dbg_diff(handle.psum_num_recv_tokens_per_scaleup_rank,
+                                 cached_handle.psum_num_recv_tokens_per_scaleup_rank, 'psum_scaleup')
+            _ok_slot = _dbg_diff(handle.dst_buffer_slot_idx, cached_handle.dst_buffer_slot_idx, 'dst_buffer_slot_idx')
+            _ok_topk = _dbg_diff(recv_topk_idx, cached_recv_topk_idx, 'recv_topk_idx')
             if use_fp8_dispatch:
                 _ok0 = _dbg_diff(recv_x[0], cached_recv_x[0], 'recv_x[fp8]')
                 _ok1 = _dbg_diff(recv_x[1], cached_recv_x[1], 'recv_x[sf]')
-                assert _ok0 and _ok1
             else:
-                assert _dbg_diff(recv_x, cached_recv_x, 'recv_x[bf16]')
-            assert _dbg_diff(recv_topk_idx, cached_recv_topk_idx, 'recv_topk_idx')
-            assert _dbg_diff(handle.dst_buffer_slot_idx, cached_handle.dst_buffer_slot_idx, 'dst_buffer_slot_idx')
-            assert _dbg_diff(handle.psum_num_recv_tokens_per_scaleup_rank, cached_handle.psum_num_recv_tokens_per_scaleup_rank, 'psum_scaleup')
+                _ok0 = _dbg_diff(recv_x, cached_recv_x, 'recv_x[bf16]')
+                _ok1 = True
+            assert _ok_psum and _ok_slot and _ok_topk and _ok0 and _ok1
             assert handle.num_recv_tokens_per_expert_list == cached_handle.num_recv_tokens_per_expert_list
 
             # Check dispatch expert count
