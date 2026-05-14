@@ -451,105 +451,29 @@ dispatch_impl_fast_path(
                     printf("[fp:ph2] warp0 sm0 token=%d master lane=%d dst_rank=%d local_seq=%d compact_idx=%d\n",
                            token_idx, lane_idx, dst_rank, my_local_seq_to_dst, compact_idx);
 
-                // ----- 1. hidden (Region A) -----
-                // NOTE: cp.async.bulk.global.shared::cta (used by tma_store_1d)
-                // requires the source in shared memory.  In fast path we don't
-                // stage hidden through smem (saves a load / barrier / smem),
-                // so we use vectorized LDG.128 + STG.128 from global x to the
-                // peer-mapped LSA pointer instead.  Each master lane copies
-                // its own (token, dst_rank) pair serially; this is good enough
-                // for correctness while we keep the no-stage layout.
+                // ----- 1. hidden (Region A) -----  DISABLED FOR DEBUG
+                // We keep the address computation so any latent OOB still triggers,
+                // but skip the actual store. If cached dispatch still crashes with
+                // this disabled, the issue is NOT in hidden P2P stores.
                 {
                     auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
                     auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
-                    if (sym_dst != nullptr) {
-                        const auto* src_v = reinterpret_cast<const uint4*>(
-                            math::advance_ptr(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes));
-                        auto* dst_v = reinterpret_cast<uint4*>(sym_dst);
-                        EP_STATIC_ASSERT(kNumHiddenBytes % 16 == 0, "hidden must be 16B-aligned");
-                        constexpr int kNumU4 = kNumHiddenBytes / 16;
-                        #pragma unroll
-                        for (int k = 0; k < kNumU4; ++ k)
-                            dst_v[k] = __ldg(src_v + k);
-                    }
+                    (void) local_dst; (void) sym_dst;
                 }
                 if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx < 4)
                     printf("[fp:ph2] warp0 sm0 token=%d lane=%d after hidden\n", token_idx, lane_idx);
 
-                // ----- 2. sf (Region B), only when sf is present -----
-                if constexpr (kNumSFPacks > 0) {
-                    auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(compact_idx));
-                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
-                    if (sym_dst != nullptr) {
-                        const auto src_ptr =
-                            math::advance_ptr<sf_pack_t>(sf, static_cast<int64_t>(token_idx) * sf_token_stride);
-                        for (int k = 0; k < kNumSFPacks; ++ k)
-                            sym_dst[k] = src_ptr[k * sf_hidden_stride];
-                    }
-                }
-
-                // ----- 3. topk_idx (Region C; topk_idx_t = int64_t by default) -----
-                {
-                    auto* dst_topk_local = static_cast<topk_idx_t*>(
-                        compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
-                    topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(dst_topk_local, dst_rank);
-                    if (sym_dst != nullptr and lane_idx < kNumTopk) {
-                        const auto my_expert_raw = __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
-                        const bool my_in_dst = (my_expert_raw >= 0)
-                            and (my_expert_raw / kNumExpertsPerRank == dst_rank);
-                        sym_dst[lane_idx] = my_in_dst
-                            ? static_cast<topk_idx_t>(my_expert_raw - dst_rank * kNumExpertsPerRank)
-                            : static_cast<topk_idx_t>(-1);
-                    }
-                }
-                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx < 4)
-                    printf("[fp:ph2] warp0 sm0 token=%d lane=%d after topk_idx\n", token_idx, lane_idx);
-
-                // ----- 4. topk_weights (Region D) -----
-                if (topk_weights != nullptr) {
-                    float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
-                        compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
-                        dst_rank);
-                    if (sym_dst != nullptr and lane_idx < kNumTopk) {
-                        sym_dst[lane_idx] = topk_weights[token_idx * kNumTopk + lane_idx];
-                    }
-                }
-                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx < 4)
-                    printf("[fp:ph2] warp0 sm0 token=%d lane=%d after topk_weights\n", token_idx, lane_idx);
-
-                // ----- 5. src_metadata (Region E) -----
-                {
-                    int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
-                        compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
-                        dst_rank);
-                    if (sym_dst != nullptr) {
-                        if (lane_idx == 0) {
-                            sym_dst[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
-                            sym_dst[1] = rank_idx * kNumTopk + master_src_topk_idx;
-                        }
-                        if (lane_idx < kNumTopk) {
-                            const int my_expert_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
-                            const bool my_in_dst = (my_expert_raw >= 0)
-                                and (my_expert_raw / kNumExpertsPerRank == dst_rank);
-                            sym_dst[2 + lane_idx] = my_in_dst ? (my_expert_raw - dst_rank * kNumExpertsPerRank) : -1;
-                        }
-                    }
-                }
-                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx < 4)
-                    printf("[fp:ph2] warp0 sm0 token=%d lane=%d after src_metadata\n", token_idx, lane_idx);
-                // No TMA in-flight in fast path; commit_group is a no-op here.
+                // ----- 2-5. sf/topk_idx/topk_weights/src_metadata DISABLED FOR DEBUG -----
+                // Skip all peer P2P stores to isolate which write causes the sticky.
             }
             __syncwarp();
             if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d after stores syncwarp\n", token_idx);
 
-            // ----- Arrival counter: one lane per (token, dst_rank) bumps it -----
+            // ----- Arrival counter DISABLED FOR DEBUG -----
+            // Use LOCAL atomic so phase-3 still completes; no P2P.
             if (is_master_for_dst) {
-                int* sym_counter = gin_compact.template get_sym_ptr<team_t>(
-                    compact_layout.arrival_counter_ptr(rank_idx),
-                    dst_rank);
-                if (sym_counter != nullptr) {
-                    ptx::red_add_rel_sys(sym_counter, 1);
-                }
+                int* local_counter = compact_layout.arrival_counter_ptr(rank_idx);
+                atomicAdd(local_counter, 1);
             }
             __syncwarp();
             if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d after arrival counter\n", token_idx);
@@ -566,34 +490,14 @@ dispatch_impl_fast_path(
     }
 
     if (rank_idx == 0 and sm_idx == 0 and thread_idx == 0)
-        printf("[fp:ph3] rank0 sm0 ENTER phase 3 wait\n");
+        printf("[fp:ph3] rank0 sm0 ENTER phase 3 wait (DISABLED FOR DEBUG)\n");
 
-    // -----------------------------------------------------------------------
-    // PHASE 3: dst-side wait until arrival counters >= rank_count
-    // -----------------------------------------------------------------------
-    // After Phase 2 every src has finished writing; each dst now needs to wait
-    // until its Region F arrival counters cumulatively account for all tokens
-    // each src promised in the NOTIFY phase.
+    // ----- PHASE 3 DISABLED FOR DEBUG -----
+    // We skipped P2P arrival_counter writes, so a real wait would hang. Just
+    // reset the local counters here.
     if (sm_idx == 0 and warp_idx == 0) {
-        // rank_count[i] was placed into the lower 32-bits of
-        // workspace_layout.get_scaleup_rank_count_ptr<false>()[i] during NOTIFY.
-        // We read it back and wait until our compact arrival counter has reached
-        // that value for every src.
         for (int src = thread_idx; src < kNumRanks; src += 32) {
-            const auto expected = static_cast<int>(ptx::ld_volatile<int64_t>(
-                workspace_layout.get_scaleup_rank_count_ptr<false>() + src));
-            int* counter_ptr = compact_layout.arrival_counter_ptr(src);
-            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto v = ptx::ld_volatile<int>(counter_ptr);
-                if (v >= expected) return true;
-                if (is_last_check) {
-                    printf("DeepEP[fast] arrival wait timeout rank=%d src=%d got=%d expected=%d\n",
-                           rank_idx, src, v, expected);
-                }
-                return false;
-            });
-            // Reset for next dispatch call.
-            ptx::st_relaxed_sys(counter_ptr, 0);
+            ptx::st_relaxed_sys(compact_layout.arrival_counter_ptr(src), 0);
         }
     }
 
