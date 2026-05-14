@@ -404,10 +404,6 @@ dispatch_impl_fast_path(
         const auto stride      = total_warps * kNumSMs;
 
         for (int token_idx = warp_global; token_idx < num_tokens; token_idx += stride) {
-            // Per-iteration milestone for warp 0 sm 0 lane 0 (rank 0): every token in the warp.
-            const bool debug_first = (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and lane_idx == 0);
-            if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d enter\n", token_idx);
-
             // Each lane (lane_idx in [0, 32)) handles topk slot lane_idx (only first kNumTopk are valid).
             const int  topk_lane         = lane_idx < kNumTopk ? lane_idx : -1;
             const int  raw_expert        = topk_lane >= 0 ?
@@ -431,7 +427,6 @@ dispatch_impl_fast_path(
                 my_local_seq_to_dst = atomicAdd(
                     workspace_layout.get_scaleup_atomic_sender_counter() + dst_rank, 1);
             }
-            if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d after atomic alloc\n", token_idx);
 
             // Also record into dst_buffer_slot_idx so combine() can route reverse.
             // Format matches legacy: rank_idx * kNumMaxTokensPerRank + local_seq, or -1.
@@ -441,77 +436,135 @@ dispatch_impl_fast_path(
                 dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx] = val;
             }
             __syncwarp();
-            if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d after dst_buffer_slot_idx\n", token_idx);
 
             if (is_master_for_dst) {
                 // Compact tensor index on dst rank.
                 const int compact_idx = s_my_compact_base[dst_rank] + my_local_seq_to_dst;
                 EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
-                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx < 4)
-                    printf("[fp:ph2] warp0 sm0 token=%d master lane=%d dst_rank=%d local_seq=%d compact_idx=%d\n",
-                           token_idx, lane_idx, dst_rank, my_local_seq_to_dst, compact_idx);
 
-                // ----- 1. hidden (Region A) -----  DISABLED FOR DEBUG
-                // We keep the address computation so any latent OOB still triggers,
-                // but skip the actual store. If cached dispatch still crashes with
-                // this disabled, the issue is NOT in hidden P2P stores.
+                // ----- 1. hidden (Region A) -----
                 {
                     auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
                     auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
-                    (void) local_dst; (void) sym_dst;
+                    if (sym_dst != nullptr) {
+                        const auto src_ptr = math::advance_ptr(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes);
+                        ptx::tma_store_1d(sym_dst, src_ptr, kNumHiddenBytes);
+                    }
                 }
-                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx < 4)
-                    printf("[fp:ph2] warp0 sm0 token=%d lane=%d after hidden\n", token_idx, lane_idx);
 
-                // ----- 2-5. sf/topk_idx/topk_weights/src_metadata DISABLED FOR DEBUG -----
-                // Skip all peer P2P stores to isolate which write causes the sticky.
+                // ----- 2. sf (Region B), only when sf is present -----
+                if constexpr (kNumSFPacks > 0) {
+                    auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(compact_idx));
+                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
+                    if (sym_dst != nullptr) {
+                        const auto src_ptr =
+                            math::advance_ptr<sf_pack_t>(sf, static_cast<int64_t>(token_idx) * sf_token_stride);
+                        for (int k = 0; k < kNumSFPacks; ++ k)
+                            sym_dst[k] = src_ptr[k * sf_hidden_stride];
+                    }
+                }
+
+                // ----- 3. topk_idx (Region C; topk_idx_t = int64_t by default) -----
+                {
+                    auto* dst_topk_local = static_cast<topk_idx_t*>(
+                        compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
+                    topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(dst_topk_local, dst_rank);
+                    if (sym_dst != nullptr and lane_idx < kNumTopk) {
+                        const auto my_expert_raw = __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
+                        const bool my_in_dst = (my_expert_raw >= 0)
+                            and (my_expert_raw / kNumExpertsPerRank == dst_rank);
+                        sym_dst[lane_idx] = my_in_dst
+                            ? static_cast<topk_idx_t>(my_expert_raw - dst_rank * kNumExpertsPerRank)
+                            : static_cast<topk_idx_t>(-1);
+                    }
+                }
+
+                // ----- 4. topk_weights (Region D) -----
+                if (topk_weights != nullptr) {
+                    float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
+                        compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
+                        dst_rank);
+                    if (sym_dst != nullptr and lane_idx < kNumTopk) {
+                        sym_dst[lane_idx] = topk_weights[token_idx * kNumTopk + lane_idx];
+                    }
+                }
+
+                // ----- 5. src_metadata (Region E) -----
+                {
+                    int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
+                        compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
+                        dst_rank);
+                    if (sym_dst != nullptr) {
+                        if (lane_idx == 0) {
+                            sym_dst[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
+                            sym_dst[1] = rank_idx * kNumTopk + master_src_topk_idx;
+                        }
+                        if (lane_idx < kNumTopk) {
+                            const int my_expert_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
+                            const bool my_in_dst = (my_expert_raw >= 0)
+                                and (my_expert_raw / kNumExpertsPerRank == dst_rank);
+                            sym_dst[2 + lane_idx] = my_in_dst ? (my_expert_raw - dst_rank * kNumExpertsPerRank) : -1;
+                        }
+                    }
+                }
+
+                ptx::tma_store_commit();
             }
             __syncwarp();
-            if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d after stores syncwarp\n", token_idx);
 
-            // ----- Arrival counter DISABLED FOR DEBUG -----
-            // Use LOCAL atomic so phase-3 still completes; no P2P.
+            // ----- Arrival counter: one lane per (token, dst_rank) bumps it -----
             if (is_master_for_dst) {
-                int* local_counter = compact_layout.arrival_counter_ptr(rank_idx);
-                atomicAdd(local_counter, 1);
+                int* sym_counter = gin_compact.template get_sym_ptr<team_t>(
+                    compact_layout.arrival_counter_ptr(rank_idx),
+                    dst_rank);
+                if (sym_counter != nullptr) {
+                    ptx::red_add_rel_sys(sym_counter, 1);
+                }
             }
             __syncwarp();
-            if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d after arrival counter\n", token_idx);
 
             // Maintain copied_topk_idx for the EPHandle (host expects this).
             if (copied_topk_idx != nullptr and warp_idx == 0 and sm_idx == 0 and lane_idx < kNumTopk) {
                 copied_topk_idx[token_idx * kNumTopk + lane_idx] =
                     __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
             }
-            if (debug_first) printf("[fp:ph2] warp0 sm0 token=%d done\n", token_idx);
         }
-        if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and lane_idx == 0)
-            printf("[fp:ph2] warp0 sm0 EXITED token loop (num_tokens=%d, stride=%d)\n", num_tokens, stride);
     }
 
-    if (rank_idx == 0 and sm_idx == 0 and thread_idx == 0)
-        printf("[fp:ph3] rank0 sm0 ENTER phase 3 wait (DISABLED FOR DEBUG)\n");
-
-    // ----- PHASE 3 DISABLED FOR DEBUG -----
-    // We skipped P2P arrival_counter writes, so a real wait would hang. Just
-    // reset the local counters here.
+    // -----------------------------------------------------------------------
+    // PHASE 3: dst-side wait until arrival counters >= rank_count
+    // -----------------------------------------------------------------------
+    // After Phase 2 every src has finished writing; each dst now needs to wait
+    // until its Region F arrival counters cumulatively account for all tokens
+    // each src promised in the NOTIFY phase.
     if (sm_idx == 0 and warp_idx == 0) {
+        // rank_count[i] was placed into the lower 32-bits of
+        // workspace_layout.get_scaleup_rank_count_ptr<false>()[i] during NOTIFY.
+        // We read it back and wait until our compact arrival counter has reached
+        // that value for every src.
         for (int src = thread_idx; src < kNumRanks; src += 32) {
-            ptx::st_relaxed_sys(compact_layout.arrival_counter_ptr(src), 0);
+            const auto expected = static_cast<int>(ptx::ld_volatile<int64_t>(
+                workspace_layout.get_scaleup_rank_count_ptr<false>() + src));
+            int* counter_ptr = compact_layout.arrival_counter_ptr(src);
+            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                const auto v = ptx::ld_volatile<int>(counter_ptr);
+                if (v >= expected) return true;
+                if (is_last_check) {
+                    printf("DeepEP[fast] arrival wait timeout rank=%d src=%d got=%d expected=%d\n",
+                           rank_idx, src, v, expected);
+                }
+                return false;
+            });
+            // Reset for next dispatch call.
+            ptx::st_relaxed_sys(counter_ptr, 0);
         }
     }
-
-    if (rank_idx == 0 and sm_idx == 0 and thread_idx == 0)
-        printf("[fp:ph3] rank0 sm0 BEFORE final barrier\n");
 
     // Final cross-SM barrier to ensure all dst arrivals visible before kernel return.
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
                       comm::kDispatchTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
-
-    if (rank_idx == 0 and sm_idx == 0 and thread_idx == 0)
-        printf("[fp:ph3] rank0 sm0 AFTER final barrier\n");
 
     // Reset workspace atomic sender counters (one per dst rank) so the next
     // dispatch() call starts from 0.  Same as legacy dispatch_impl end.
