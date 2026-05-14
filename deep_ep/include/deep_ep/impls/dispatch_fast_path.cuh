@@ -95,10 +95,14 @@ dispatch_impl_fast_path(
     const auto workspace_layout      = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
     const auto host_workspace_layout = layout::WorkspaceLayout(mapped_host_workspace, 1, kNumRanks, kNumExperts);
 
-    extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
+    // Static smem (avoids the cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)
+    // path entirely; that call was reporting CUDA_ERROR_INVALID_VALUE on sm_103
+    // for this kernel for reasons not yet understood).  Sized via template
+    // constants so each instantiation gets exactly the smem it needs.
     constexpr int kNumSmemBytesForNotify = kNumNotifyThreads > 0 ?
         math::constexpr_align(kNumRanks + kNumExperts, kNumNotifyThreads) * sizeof(int) : 0;
     EP_STATIC_ASSERT(kNumSmemBytesForNotify % ptx::kNumTMAAlignBytes == 0, "Invalid TMA alignment");
+    __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[kNumSmemBytesForNotify > 0 ? kNumSmemBytesForNotify : 16];
 
     // Compact recv buffer layout helper (local copy; LSA-translated to dst at write time)
     constexpr int kSFBytesPerToken = kNumSFPacks * static_cast<int>(sizeof(sf_pack_t));

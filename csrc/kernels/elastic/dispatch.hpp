@@ -436,11 +436,13 @@ static void launch_dispatch_fast_path(void* x, void* sf,
         math::ceil_div(512, num_sms));
     const int num_threads = (num_notify_warps + num_dispatch_warps) * 32;
 
-    // Fast-path NOTIFY phase uses `extern __shared__` for rank_count+expert_count.
-    // Host-side num_notify_smem_bytes is the same calculation as kernel-side
-    // kNumSmemBytesForNotify, so just request that.
-    const int fast_path_smem_bytes = num_notify_smem_bytes;
+    // Fast-path kernel uses STATIC smem (kNumSmemBytesForNotify, sized by
+    // template constants). Request 0 dynamic smem so cuFuncSetAttribute is
+    // not called -- on sm_103 that call was returning CUDA_ERROR_INVALID_VALUE
+    // for this kernel.
+    const int fast_path_smem_bytes = 0;
     (void)num_smem_bytes;
+    (void)num_notify_smem_bytes;
 
     const DispatchFastPathRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
