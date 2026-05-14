@@ -251,7 +251,7 @@ public:
         return true;
     }
 
-    void destroy_compact_recv_window() {
+    void destroy_compact_recv_window() const {
         if (compact_window != nullptr) {
             NCCL_CHECK(ncclCommWindowDeregister(nccl_context->comm, compact_window));
             NCCL_CHECK(ncclMemFree(compact_raw_ptr));
