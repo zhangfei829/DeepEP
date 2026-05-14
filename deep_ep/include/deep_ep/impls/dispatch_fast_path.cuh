@@ -302,20 +302,18 @@ dispatch_impl_fast_path(
             // Equivalent recv-side: peer_psum_row_ptr(dst_rank=rank_idx) of this rank's
             // local Region G is written by each remote peer, providing this rank with
             // its compact base offset on each dst.
-            // dst (this rank) broadcasts its INCLUSIVE psum into every peer's
-            // peer_psum_buf row [dst_rank_idx=rank_idx][src_rank_idx=*]. Use
-            // gin_compact because dst_psum_slot is inside compact_window.
-            // Note: psum is inclusive; the src will read its own slot and
-            // interpret it as the exclusive prefix - meaning "src 0..i-1
-            // count up to me on this dst rank" rather than "src 0..i". We
-            // therefore write exclusive value here.
+            // dst (this rank) broadcasts its exclusive psum into every peer's
+            // peer_psum_buf row [dst_rank_idx=rank_idx][src_rank_idx=*].
+            // Encoding: store (psum_val + 1) so 0 means "not arrived yet";
+            // the src side spin-waits for non-zero then subtracts 1.
+            // This avoids needing a second gpu_barrier (which would clash on
+            // signal slot reuse for the same Tag).
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                 int* dst_psum_slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/rank_idx,
                                                                   /*src_rank_idx=*/i);
-                // Exclusive prefix: count of tokens from src 0..(i-1) into me.
                 const int psum_val_exclusive = (i == 0) ? 0
                     : psum_num_recv_tokens_per_scaleup_rank[i - 1];
-                gin_compact.put_value<team_t>(dst_psum_slot, psum_val_exclusive, i,
+                gin_compact.put_value<team_t>(dst_psum_slot, psum_val_exclusive + 1, i,
                                               ncclGinOptFlagsAggregateRequests);
             }
             __syncwarp();
@@ -323,19 +321,13 @@ dispatch_impl_fast_path(
     }
 
     // -----------------------------------------------------------------------
-    // PHASE 1.5: src wait for peer_psum_buf to be populated by every dst.
-    // After this barrier, every thread can safely read
-    //   compact_layout.peer_psum_ptr(dst_rank, my_rank=rank_idx)
-    // to get "my compact base offset on dst_rank".
+    // PHASE 1.5: spin-wait for peer_psum_buf to be populated by every dst.
+    // No NCCL gpu_barrier here - same tag would reuse a signal slot that
+    // NOTIFY phase already consumed, causing signal-count OOB and ILLEGAL
+    // address.  The spin-wait reads "encoded + 1" values; non-zero means the
+    // remote dst already wrote (psum_val + 1) into this slot.
     // -----------------------------------------------------------------------
-    // Single global barrier across the whole grid (uses workspace tag 1).
-    // ALL warps wait here.
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
-                      comm::kDispatchTag0, true, true, true>(
-        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
-
-    // All threads on all SMs now drop into PHASE 2 below.
+    __syncthreads();  // local barrier so warps don't race on the wait below
 
     // -----------------------------------------------------------------------
     // PHASE 2: ALL warps do compact DISPATCH.
@@ -351,14 +343,17 @@ dispatch_impl_fast_path(
         // Per-dst compact base offset cache: 32 entries fit in registers.
         EP_STATIC_ASSERT(kNumRanks <= 64, "Compact base cache assumes kNumRanks <= 64");
 
-        // Load my row of peer_psum into shared memory once for the whole block.
-        // compact_layout.peer_psum_ptr(dst_rank, src_rank=rank_idx) on local rank gives
-        // "in dst_rank's view, # tokens before me" which equals MY compact base on dst_rank.
+        // Load my row of peer_psum into shared memory once per block.
+        // Spin-wait the encoded "+1" sentinel: 0 = not arrived; v > 0 = (psum+1).
         __shared__ int s_my_compact_base[kNumRanks];
         if (thread_idx < kNumRanks) {
-            s_my_compact_base[thread_idx] = ptx::ld_volatile<int>(
-                compact_layout.peer_psum_ptr(/*dst_rank_idx=*/thread_idx,
-                                              /*src_rank_idx=*/rank_idx));
+            int* slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/thread_idx,
+                                                      /*src_rank_idx=*/rank_idx);
+            int v;
+            do {
+                v = ptx::ld_volatile<int>(slot);
+            } while (v == 0);
+            s_my_compact_base[thread_idx] = v - 1;
         }
         __syncthreads();
 
@@ -535,6 +530,13 @@ dispatch_impl_fast_path(
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
     if (sm_idx == 0 and thread_idx < kNumRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+
+    // Reset peer_psum_buf slots that THIS rank will spin-wait on next dispatch.
+    // As src=my_rank, we read [d][my_rank] for d in [0, kNumRanks); clear them
+    // here so the +1 sentinel is back to 0 for the next call.
+    if (sm_idx == 0 and thread_idx < kNumRanks) {
+        *compact_layout.peer_psum_ptr(/*dst=*/thread_idx, /*src=*/rank_idx) = 0;
+    }
 }
 
 }  // namespace deep_ep::elastic
