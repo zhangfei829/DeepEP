@@ -122,6 +122,10 @@ dispatch_impl_fast_path(
         /*dispatch_warp_idx_hint=*/(warp_idx >= kNumNotifyWarps ? warp_idx - kNumNotifyWarps : 0),
         warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+    // Separate Gin handle for compact_recv_window: LSA pointer translation in
+    // get_sym_ptr / put_value uses the window-specific lsa_base, so writes
+    // targeted at compact_window must use a Gin built on compact_window.
+    const auto gin_compact = handle::NCCLGin(nccl_dev_comm, compact_window, qp_idx, sharing_mode);
 
     // Cross-SM kickoff barrier (same as legacy).  No grid-sync prologue.
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
@@ -298,14 +302,21 @@ dispatch_impl_fast_path(
             // Equivalent recv-side: peer_psum_row_ptr(dst_rank=rank_idx) of this rank's
             // local Region G is written by each remote peer, providing this rank with
             // its compact base offset on each dst.
+            // dst (this rank) broadcasts its INCLUSIVE psum into every peer's
+            // peer_psum_buf row [dst_rank_idx=rank_idx][src_rank_idx=*]. Use
+            // gin_compact because dst_psum_slot is inside compact_window.
+            // Note: psum is inclusive; the src will read its own slot and
+            // interpret it as the exclusive prefix - meaning "src 0..i-1
+            // count up to me on this dst rank" rather than "src 0..i". We
+            // therefore write exclusive value here.
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                 int* dst_psum_slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/rank_idx,
                                                                   /*src_rank_idx=*/i);
-                // dtype_t deduced from sym_ptr (int*); value must be int too,
-                // not int64_t, otherwise template deduction conflicts.
-                const int psum_val = psum_num_recv_tokens_per_scaleup_rank[i];
-                gin.put_value<team_t>(dst_psum_slot, psum_val, i,
-                                      ncclGinOptFlagsAggregateRequests);
+                // Exclusive prefix: count of tokens from src 0..(i-1) into me.
+                const int psum_val_exclusive = (i == 0) ? 0
+                    : psum_num_recv_tokens_per_scaleup_rank[i - 1];
+                gin_compact.put_value<team_t>(dst_psum_slot, psum_val_exclusive, i,
+                                              ncclGinOptFlagsAggregateRequests);
             }
             __syncwarp();
         }
@@ -398,7 +409,7 @@ dispatch_impl_fast_path(
                 // ----- 1. hidden (Region A) -----
                 {
                     auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
-                    auto* sym_dst   = gin.template get_sym_ptr<team_t>(local_dst, dst_rank);
+                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
                     if (sym_dst != nullptr) {
                         const auto src_ptr = math::advance_ptr(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes);
                         ptx::tma_store_1d(sym_dst, src_ptr, kNumHiddenBytes);
@@ -408,17 +419,12 @@ dispatch_impl_fast_path(
                 // ----- 2. sf (Region B), only when sf is present -----
                 if constexpr (kNumSFPacks > 0) {
                     auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(compact_idx));
-                    auto* sym_dst   = gin.template get_sym_ptr<team_t>(local_dst, dst_rank);
+                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
                     if (sym_dst != nullptr) {
                         const auto src_ptr =
                             math::advance_ptr<sf_pack_t>(sf, static_cast<int64_t>(token_idx) * sf_token_stride);
-                        // sf is interleaved by `sf_hidden_stride` between packs in legacy layout;
-                        // for fast path we write the contiguous packed form.
-                        constexpr int kSFBytes = kNumSFPacks * sizeof(sf_pack_t);
-                        // Naive per-pack copy (small data, <<1 KB per token).
                         for (int k = 0; k < kNumSFPacks; ++ k)
                             sym_dst[k] = src_ptr[k * sf_hidden_stride];
-                        (void)kSFBytes;
                     }
                 }
 
@@ -426,7 +432,7 @@ dispatch_impl_fast_path(
                 {
                     auto* dst_topk_local = static_cast<topk_idx_t*>(
                         compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
-                    topk_idx_t* sym_dst = gin.template get_sym_ptr<team_t, topk_idx_t>(dst_topk_local, dst_rank);
+                    topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(dst_topk_local, dst_rank);
                     if (sym_dst != nullptr and lane_idx < kNumTopk) {
                         const auto my_expert_raw = __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
                         const bool my_in_dst = (my_expert_raw >= 0)
@@ -439,7 +445,7 @@ dispatch_impl_fast_path(
 
                 // ----- 4. topk_weights (Region D) -----
                 if (topk_weights != nullptr) {
-                    float* sym_dst = gin.template get_sym_ptr<team_t>(
+                    float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
                         compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
                         dst_rank);
                     if (sym_dst != nullptr and lane_idx < kNumTopk) {
@@ -447,9 +453,9 @@ dispatch_impl_fast_path(
                     }
                 }
 
-                // ----- 5. src_metadata (Region E): [src_rank_idx, src_token_rank_idx*kNumTopk+master_topk, expert_id_0..expert_id_{kNumTopk-1}] -----
+                // ----- 5. src_metadata (Region E) -----
                 {
-                    int* sym_dst = gin.template get_sym_ptr<team_t>(
+                    int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
                         compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
                         dst_rank);
                     if (sym_dst != nullptr) {
@@ -458,10 +464,6 @@ dispatch_impl_fast_path(
                             sym_dst[1] = rank_idx * kNumTopk + master_src_topk_idx;
                         }
                         if (lane_idx < kNumTopk) {
-                            // Mirror legacy recv_src_metadata[i*(num_topk+2)+2+k] = dst_tensor_idx_in_local_expert
-                            // For non-expand, this is -1 unless lane's expert is local to dst_rank, in which case
-                            // it's the local expert index.  Legacy writes the local expert idx unconditionally
-                            // (sentinel -1 for out-of-rank).
                             const int my_expert_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
                             const bool my_in_dst = (my_expert_raw >= 0)
                                 and (my_expert_raw / kNumExpertsPerRank == dst_rank);
@@ -470,14 +472,13 @@ dispatch_impl_fast_path(
                     }
                 }
 
-                // Make sure all TMA stores from this iteration are committed before signalling arrival.
                 ptx::tma_store_commit();
             }
             __syncwarp();
 
             // ----- Arrival counter: one lane per (token, dst_rank) bumps it -----
             if (is_master_for_dst) {
-                int* sym_counter = gin.template get_sym_ptr<team_t>(
+                int* sym_counter = gin_compact.template get_sym_ptr<team_t>(
                     compact_layout.arrival_counter_ptr(rank_idx),
                     dst_rank);
                 if (sym_counter != nullptr) {
