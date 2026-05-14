@@ -353,11 +353,12 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             test_dispatch_combine._printed_warps_meta = _printed_warps_meta
             if buffer.rank_idx == 0:
                 _maybe_print_kernel_warps_metadata(_printed_warps_meta)
+            _copy_bw = (2 * num_recv_tokens * num_bytes_per_dispatch_token / copy_t / 1e9) if copy_t > 0 else 0
             dist_print(f'   * EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'copy: {2 * num_recv_tokens * num_bytes_per_dispatch_token / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'copy: {_copy_bw:.0f} GB/s, {copy_t * 1e6:.3f} us | '
                     f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
 
             # Test expanded dispatch performance
@@ -366,11 +367,12 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                                     kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('expanded_dispatch'))
             api_t = bench_api_walltime(lambda: buffer.dispatch(**expanded_dispatch_args), barrier=buffer.barrier)
+            _copy_bw = ((num_recv_tokens * (num_bytes_per_dispatch_token_meta + num_bytes_per_dispatch_token) + num_expanded_tokens * num_bytes_per_dispatch_token) / copy_t / 1e9) if copy_t > 0 else 0
             dist_print(f'   - EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'expanded dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'copy: {(num_recv_tokens * (num_bytes_per_dispatch_token_meta + num_bytes_per_dispatch_token) + num_expanded_tokens * num_bytes_per_dispatch_token) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'copy: {_copy_bw:.0f} GB/s, {copy_t * 1e6:.3f} us | '
                     f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
 
             # Test cached dispatch performance
@@ -378,11 +380,12 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                                     kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
                                     barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('cached_dispatch'))
             api_t = bench_api_walltime(lambda: buffer.dispatch(**cached_dispatch_args), barrier=buffer.barrier)
+            _copy_bw = (2 * num_scaleup_bytes / copy_t / 1e9) if copy_t > 0 else 0
             dist_print(f'   # EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'cached dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
-                    f'copy: {2 * num_scaleup_bytes / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                    f'copy: {_copy_bw:.0f} GB/s, {copy_t * 1e6:.3f} us | '
                     f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO api), {num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU api), {api_t * 1e6:.3f} us')
 
             # Test combine performance
