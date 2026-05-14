@@ -218,16 +218,11 @@ public:
         // This is what actually establishes the P2P mapping on the local GPU;
         // without it, a remote rank's write into this window from NVLink P2P
         // lands at an address that is not P2P-accessible on this GPU and
-        // triggers CUDA_ERROR_ILLEGAL_ADDRESS later (during next CUDA call).
-        // (The legacy `nccl_window` does this in NCCLSymmetricMemoryContext.)
-        printf("[deepep-dbg] rank=%d ensure_compact_recv_window: num_nvl_ranks=%d, num_ranks=%d, num_scaleup_ranks=%d\n",
-               nccl_context->rank_idx, nccl_context->num_nvl_ranks,
-               nccl_context->num_ranks, nccl_context->num_scaleup_ranks);
+        // triggers CUDA_ERROR_ILLEGAL_ADDRESS later.
         for (int i = 0; i < nccl_context->num_nvl_ranks; ++ i) {
             void* tmp_peer_ptr;
             NCCL_CHECK(ncclGetLsaDevicePointer(compact_window, 0, i, &tmp_peer_ptr));
-            if (nccl_context->rank_idx == 0)
-                printf("[deepep-dbg] rank=0 LSA peer %d -> %p\n", i, tmp_peer_ptr);
+            (void) tmp_peer_ptr;
         }
 
         // Cache config.
@@ -783,15 +778,6 @@ public:
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
              const bool& use_tma_aligned_col_major_sf) const {
-        static thread_local int call_count = 0;
-        ++ call_count;
-        if (nccl_context->rank_idx == 0)
-            fprintf(stderr, "[dispatch:dbg] call #%d cached=%d do_expand=%d do_cpu_sync=%d sf=%d\n",
-                    call_count, static_cast<int>(cached_num_recv_tokens.has_value()),
-                    static_cast<int>(do_expand), static_cast<int>(do_cpu_sync),
-                    static_cast<int>(sf.has_value()));
-        fflush(stderr);
-
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1057,12 +1043,6 @@ public:
             ensure_compact_recv_window(num_max_tokens_per_rank, num_hidden_bytes,
                                        num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
                                        num_topk);
-            // DEBUG: pre-launch sync to surface any pending sticky errors.
-            {
-                const auto e = cudaStreamSynchronize(comm_stream);
-                if (e != cudaSuccess and nccl_context->rank_idx == 0)
-                    printf("[fp:dbg] PRE-launch sync error: %s\n", cudaGetErrorString(e));
-            }
             launch_dispatch_fast_path(x.data_ptr(), sf_ptr,
                                       topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
                                       copied_topk_idx_ptr,
@@ -1087,14 +1067,6 @@ public:
                                       compact_mapped_ptr,
                                       compact_window,
                                       comm_stream);
-            // DEBUG: post-launch sync; if fast-path kernel had any async illegal
-            // access this will surface it here (instead of at the next CUDA API call).
-            {
-                const auto e = cudaStreamSynchronize(comm_stream);
-                if (nccl_context->rank_idx == 0)
-                    printf("[fp:dbg] POST-launch sync: %s\n",
-                           e == cudaSuccess ? "OK" : cudaGetErrorString(e));
-            }
         } else {
             launch_dispatch(x.data_ptr(), sf_ptr,
                             topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
@@ -1341,11 +1313,6 @@ public:
         }
 
         // Stream control
-        if (fast_path and nccl_context->rank_idx == 0) {
-            const auto e = cudaStreamSynchronize(comm_stream);
-            printf("[fp:dbg] after from_blob+slice sync: %s\n",
-                   e == cudaSuccess ? "OK" : cudaGetErrorString(e));
-        }
         const auto event = stream_control_epilogue(
             {x, sf, topk_idx, topk_weights,
              recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
@@ -1360,14 +1327,6 @@ public:
              channel_linked_list},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
-
-        if (fast_path and nccl_context->rank_idx == 0) {
-            const auto e1 = cudaDeviceSynchronize();
-            const auto e2 = cudaGetLastError();
-            printf("[fp:dbg] after stream_control_epilogue sync: %s; last_err=%s\n",
-                   e1 == cudaSuccess ? "OK" : cudaGetErrorString(e1),
-                   e2 == cudaSuccess ? "OK" : cudaGetErrorString(e2));
-        }
 
         return {recv_x, recv_sf,
                 recv_topk_idx, recv_topk_weights,

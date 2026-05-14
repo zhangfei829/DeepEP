@@ -95,14 +95,13 @@ dispatch_impl_fast_path(
     const auto workspace_layout      = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
     const auto host_workspace_layout = layout::WorkspaceLayout(mapped_host_workspace, 1, kNumRanks, kNumExperts);
 
-    // Static smem (avoids the cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)
-    // path entirely; that call was reporting CUDA_ERROR_INVALID_VALUE on sm_103
-    // for this kernel for reasons not yet understood).  Sized via template
-    // constants so each instantiation gets exactly the smem it needs.
+    // Dynamic shared memory: NOTIFY counters region (first kNumSmemBytesForNotify)
+    // followed by kNumDispatchWarps per-warp tma_buffer slots (same layout as
+    // legacy dispatch_impl). Host launches with num_smem_bytes >= notify + warps*tma_buffer_bytes.
     constexpr int kNumSmemBytesForNotify = kNumNotifyThreads > 0 ?
         math::constexpr_align(kNumRanks + kNumExperts, kNumNotifyThreads) * sizeof(int) : 0;
     EP_STATIC_ASSERT(kNumSmemBytesForNotify % ptx::kNumTMAAlignBytes == 0, "Invalid TMA alignment");
-    __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[kNumSmemBytesForNotify > 0 ? kNumSmemBytesForNotify : 16];
+    extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
 
     // Compact recv buffer layout helper (local copy; LSA-translated to dst at write time)
     constexpr int kSFBytesPerToken = kNumSFPacks * static_cast<int>(sizeof(sf_pack_t));
@@ -133,16 +132,9 @@ dispatch_impl_fast_path(
                       comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
-    if (sm_idx == 0 and thread_idx == 0 and rank_idx == 0)
-        printf("[fp] kernel entered, num_tokens=%d, kNumRanks=%d, kNumSMs=%d\n",
-               num_tokens, kNumRanks, kNumSMs);
-
     // -----------------------------------------------------------------------
     // PHASE 1: NOTIFY (only the first kNumNotifyWarps warps participate).
-    // This is intentionally identical to the legacy NOTIFY phase, since
-    // letting all 12 warps participate gives <1us of headroom and complicates
-    // smem layout.  The "12+12" design is fully captured by Phase 2 where all
-    // warps stream the heavy hidden traffic.
+    // Identical to legacy NOTIFY, plus the dst->src G broadcast at the end.
     // -----------------------------------------------------------------------
     if (warp_idx < kNumNotifyWarps) {
         constexpr int kNotifyBarrierIndex = 1;
@@ -306,15 +298,9 @@ dispatch_impl_fast_path(
             // Equivalent recv-side: peer_psum_row_ptr(dst_rank=rank_idx) of this rank's
             // local Region G is written by each remote peer, providing this rank with
             // its compact base offset on each dst.
-            if (rank_idx == 0 and thread_idx == 0)
-                printf("[fp] entering psum broadcast, rank_idx=%d\n", rank_idx);
-
-            // dst (this rank) broadcasts its exclusive psum into every peer's
-            // peer_psum_buf row [dst_rank_idx=rank_idx][src_rank_idx=*].
+            //
             // Encoding: store (psum_val + 1) so 0 means "not arrived yet";
             // the src side spin-waits for non-zero then subtracts 1.
-            // This avoids needing a second gpu_barrier (which would clash on
-            // signal slot reuse for the same Tag).
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                 int* dst_psum_slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/rank_idx,
                                                                   /*src_rank_idx=*/i);
@@ -323,187 +309,209 @@ dispatch_impl_fast_path(
                 gin_compact.put_value<team_t>(dst_psum_slot, psum_val_exclusive + 1, i,
                                               ncclGinOptFlagsAggregateRequests);
             }
-
-            // Make NVLink writes visible.
             __threadfence_system();
-            __syncwarp();
-
-            // Self-write sanity check: rank 0 reads back its own broadcast to itself.
-            if (rank_idx == 0 and thread_idx == 0) {
-                int* self_slot = compact_layout.peer_psum_ptr(/*dst=*/0, /*src=*/0);
-                const int v = ptx::ld_volatile<int>(self_slot);
-                printf("[fp] rank0 self-broadcast check: G[0][0] = %d (expected 1)\n", v);
-                // Sleep then read G[d=*][s=0] (writes peers should have made):
-                for (int spin = 0; spin < 1000000; ++spin) {
-                    if (clock64() & 0xffffffff) { /* burn cycles */ }
-                }
-                for (int d = 0; d < kNumRanks; ++d) {
-                    int v2 = ptx::ld_volatile<int>(compact_layout.peer_psum_ptr(d, 0));
-                    printf("[fp] rank0 G[d=%d][s=0]=%d\n", d, v2);
-                }
-            }
             __syncwarp();
         }
     }
 
     // -----------------------------------------------------------------------
     // PHASE 1.5: spin-wait for peer_psum_buf to be populated by every dst.
-    // No NCCL gpu_barrier here - same tag would reuse a signal slot that
-    // NOTIFY phase already consumed, causing signal-count OOB and ILLEGAL
-    // address.  The spin-wait reads "encoded + 1" values; non-zero means the
-    // remote dst already wrote (psum_val + 1) into this slot.
+    // The spin-wait reads "encoded + 1" values; non-zero means the remote
+    // dst already wrote (psum_val + 1) into this slot.
     // -----------------------------------------------------------------------
-    __syncthreads();  // local barrier so warps don't race on the wait below
+    __syncthreads();
 
-    if (sm_idx == 0 and thread_idx == 0 and rank_idx == 0)
-        printf("[fp] phase 1.5 spin-wait peer_psum, rank_idx=%d\n", rank_idx);
-
-    // -----------------------------------------------------------------------
-    // PHASE 2: ALL warps do compact DISPATCH.
-    // Each (warp, sm) pair iterates a stride of (kNumThreads/32) * kNumSMs
-    // through `num_tokens`.  For each token's `kNumTopk` expert hits, find the
-    // dst rank, look up dst's compact base offset (peer_psum row), add the
-    // src-local sequence number stored in `dst_buffer_slot_idx`, then emit 5
-    // TMA stores (hidden + sf + topk_idx + topk_weights + src_metadata).
-    // After every token, atomically bump the dst's Region F arrival counter
-    // for my src index.
-    // -----------------------------------------------------------------------
-    {
-        // Per-dst compact base offset cache: 32 entries fit in registers.
-        EP_STATIC_ASSERT(kNumRanks <= 64, "Compact base cache assumes kNumRanks <= 64");
-
-        // Load my row of peer_psum into shared memory once per block.
-        // Spin-wait the encoded "+1" sentinel: 0 = not arrived; v > 0 = (psum+1).
-        __shared__ int s_my_compact_base[kNumRanks];
-        if (thread_idx < kNumRanks) {
-            int* slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/thread_idx,
-                                                      /*src_rank_idx=*/rank_idx);
-            int v = 0;
-            const auto t0 = clock64();
-            while (v == 0) {
-                v = ptx::ld_volatile<int>(slot);
-                if (clock64() - t0 > kNumTimeoutCycles) {
-                    printf("[fp:ERR] rank=%d sm=%d wait_psum from dst=%d TIMEOUT (slot=%p)\n",
-                           rank_idx, sm_idx, thread_idx, slot);
-                    return;  // bail out (kernel exit), avoids hang
-                }
+    // Load my row of peer_psum into shared memory once per block.
+    __shared__ int s_my_compact_base[kNumRanks];
+    if (thread_idx < kNumRanks) {
+        int* slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/thread_idx,
+                                                  /*src_rank_idx=*/rank_idx);
+        int v = 0;
+        const auto t0 = clock64();
+        while (v == 0) {
+            v = ptx::ld_volatile<int>(slot);
+            if (clock64() - t0 > kNumTimeoutCycles) {
+                printf("DeepEP[fast] wait_psum TIMEOUT rank=%d sm=%d dst=%d\n",
+                       rank_idx, sm_idx, thread_idx);
+                ptx::trap();
             }
-            s_my_compact_base[thread_idx] = v - 1;
         }
-        __syncthreads();
+        s_my_compact_base[thread_idx] = v - 1;
+    }
+    __syncthreads();
 
-        if (sm_idx == 0 and thread_idx == 0 and rank_idx == 0) {
-            printf("[fp] phase 2 start, my_compact_base[0..3]=%d,%d,%d,%d\n",
-                   s_my_compact_base[0], s_my_compact_base[1],
-                   s_my_compact_base[2], s_my_compact_base[3]);
-        }
+    // -----------------------------------------------------------------------
+    // PHASE 2: dispatch warps do staged TMA stores (same pipeline as legacy
+    // dispatch_impl, but dst is compact_buffer regions A/B/C/D/E indexed by
+    // compact_idx, not legacy per-rank packed slot).
+    //
+    // Per-warp tma_buffer (in dynamic smem, after the NOTIFY region) stages
+    // hidden + sf + topk_idx + topk_weights + metadata. Then for each unique
+    // dst_rank in the token's topk:
+    //   - TMA store smem hidden -> peer compact A[compact_idx]
+    //   - TMA store smem sf -> peer compact B[compact_idx]
+    //   - master lane writes full topk_idx / topk_weights / src_metadata rows
+    //     directly to peer regions (small, no smem staging needed)
+    //   - master lane red_add_rel_sys to peer arrival_counter[my_rank]
+    // -----------------------------------------------------------------------
+    if (warp_idx >= kNumNotifyWarps) {
+        const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
 
-        // Token stride: each warp picks tokens at (warp_idx * kNumSMs + sm_idx + k * total_warps * kNumSMs).
-        const auto total_warps = kNumThreads / 32;
-        const auto warp_global = warp_idx * kNumSMs + sm_idx;
-        const auto stride      = total_warps * kNumSMs;
+        // Per-warp tma_buffer in dynamic smem after the notify region.
+        const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kSFBytesPerToken, kNumTopk, true);
+        const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumDispatchWarps, 1,
+            math::advance_ptr<int8_t>(smem, kNumSmemBytesForNotify))
+            .get_rank_buffer(dispatch_warp_idx).get_token_buffer(0);
 
-        for (int token_idx = warp_global; token_idx < num_tokens; token_idx += stride) {
-            // Each lane (lane_idx in [0, 32)) handles topk slot lane_idx (only first kNumTopk are valid).
-            const int  topk_lane         = lane_idx < kNumTopk ? lane_idx : -1;
-            const int  raw_expert        = topk_lane >= 0 ?
-                static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + topk_lane)) : -1;
-            const bool in_range          = raw_expert >= 0;
-            const int  dst_rank          = in_range ? raw_expert / kNumExpertsPerRank : -1;
-            const int  dst_expert_local  = in_range ? raw_expert - dst_rank * kNumExpertsPerRank : -1;
+        // Init mbarrier (legacy pattern)
+        ptx::arrival_phase phase = 0;
+        const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
+        if (ptx::elect_one_sync())
+            ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
+        __syncwarp();
 
-            // Deduplicate (token, dst_rank) so we only emit one TMA store per (token, unique dst).
-            const bool is_master_for_dst = ptx::deduplicate(dst_rank, lane_idx) and in_range;
+        const auto token_start  = dispatch_warp_idx * kNumSMs + sm_idx;
+        const auto token_stride = kNumDispatchWarps * kNumSMs;
 
-            // master_src_topk_idx = the lowest topk_lane among lanes that share this token's dst_rank,
-            // used in src_metadata to point back at the originating topk slot.
-            const int master_src_topk_idx = ptx::get_master_lane_idx(ptx::gather(is_master_for_dst));
+        for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
+            const auto token_i64_idx = static_cast<int64_t>(token_idx);
 
-            // Allocate src-local sequence number for (this_src -> dst_rank) via atomic counter
-            // on workspace. NOTE: dst_buffer_slot_idx is uninitialized in fast-path mode
-            // (no deterministic prologue), so we MUST compute the slot ourselves here.
+            // Wait any previous TMA stores to drain
+            ptx::tma_store_wait();
+            __syncwarp();
+
+            // Issue TMA load: x[token] -> smem hidden region
+            if (ptx::elect_one_sync()) {
+                ptx::tma_load_1d(tma_buffer.get_hidden_ptr(),
+                                 math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
+                                 mbarrier_ptr, kNumHiddenBytes);
+            }
+            __syncwarp();
+
+            // Issue cp.async loads: sf[token] -> smem sf region
+            if constexpr (kNumSFPacks > 0) {
+                EP_STATIC_ASSERT(sizeof(sf_pack_t) % 4 == 0, "Unaligned SF element type");
+                const auto gmem_src_ptr = math::advance_ptr<sf_pack_t>(
+                    sf, token_i64_idx * sf_token_stride * sizeof(sf_pack_t));
+                const auto smem_dst_ptr = tma_buffer.get_sf_ptr();
+                constexpr auto kNumFullIters = kNumSFPacks / 32;
+                #pragma unroll
+                for (int k = 0; k < kNumFullIters; ++ k) {
+                    ptx::cp_async_ca(gmem_src_ptr + (k * 32 + lane_idx) * sf_hidden_stride,
+                                     smem_dst_ptr + k * 32 + lane_idx);
+                }
+                if (kNumFullIters * 32 + lane_idx < kNumSFPacks) {
+                    ptx::cp_async_ca(gmem_src_ptr + (kNumFullIters * 32 + lane_idx) * sf_hidden_stride,
+                                     smem_dst_ptr + kNumFullIters * 32 + lane_idx);
+                }
+                ptx::cp_async_mbarrier_arrive(mbarrier_ptr);
+                __syncwarp();
+            }
+
+            // Load topk and compute dst_rank per-lane
+            EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes for top-k");
+            int my_expert_raw = -1;
+            int my_dst_rank   = -1;
+            if (lane_idx < kNumTopk) {
+                my_expert_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
+                my_dst_rank   = my_expert_raw >= 0 ? my_expert_raw / kNumExpertsPerRank : -1;
+            }
+            const bool is_master_for_dst = ptx::deduplicate(my_dst_rank, lane_idx) and (my_dst_rank >= 0);
+            const int  master_src_topk_idx = ptx::get_master_lane_idx(ptx::gather(is_master_for_dst));
+
+            // Allocate src-local seq number for master lane of each unique dst
             int my_local_seq_to_dst = -1;
             if (is_master_for_dst) {
                 my_local_seq_to_dst = atomicAdd(
-                    workspace_layout.get_scaleup_atomic_sender_counter() + dst_rank, 1);
+                    workspace_layout.get_scaleup_atomic_sender_counter() + my_dst_rank, 1);
             }
 
-            // Also record into dst_buffer_slot_idx so combine() can route reverse.
-            // Format matches legacy: rank_idx * kNumMaxTokensPerRank + local_seq, or -1.
+            // Record dst_buffer_slot_idx (so combine() can reverse-route)
             if (lane_idx < kNumTopk) {
                 const auto val = my_local_seq_to_dst >= 0
                     ? (rank_idx * kNumMaxTokensPerRank + my_local_seq_to_dst) : -1;
                 dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx] = val;
             }
+
+            // copied_topk_idx for EPHandle bookkeeping
+            if (copied_topk_idx != nullptr and lane_idx < kNumTopk) {
+                copied_topk_idx[token_idx * kNumTopk + lane_idx] =
+                    static_cast<topk_idx_t>(my_expert_raw);
+            }
             __syncwarp();
 
+            // Wait TMA load completion (hidden + sf both arrived)
+            if (ptx::elect_one_sync()) {
+                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+            }
+            __syncwarp();
+
+            // For each unique dst_rank: TMA store smem -> peer compact buffer
             if (is_master_for_dst) {
-                // Compact tensor index on dst rank.
-                const int compact_idx = s_my_compact_base[dst_rank] + my_local_seq_to_dst;
+                const int compact_idx = s_my_compact_base[my_dst_rank] + my_local_seq_to_dst;
                 EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
 
-                // ----- 1. hidden (Region A) -----
+                // 1. Region A: hidden (TMA store smem -> peer)
                 {
                     auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
-                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
-                    if (sym_dst != nullptr) {
-                        const auto src_ptr = math::advance_ptr(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes);
-                        ptx::tma_store_1d(sym_dst, src_ptr, kNumHiddenBytes);
-                    }
+                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
+                    if (sym_dst != nullptr)
+                        ptx::tma_store_1d(sym_dst, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
                 }
 
-                // ----- 2. sf (Region B), only when sf is present -----
+                // 2. Region B: sf (TMA store smem -> peer, only if sf present)
                 if constexpr (kNumSFPacks > 0) {
                     auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(compact_idx));
-                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
-                    if (sym_dst != nullptr) {
-                        const auto src_ptr =
-                            math::advance_ptr<sf_pack_t>(sf, static_cast<int64_t>(token_idx) * sf_token_stride);
-                        for (int k = 0; k < kNumSFPacks; ++ k)
-                            sym_dst[k] = src_ptr[k * sf_hidden_stride];
-                    }
+                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
+                    if (sym_dst != nullptr)
+                        ptx::tma_store_1d(reinterpret_cast<void*>(sym_dst),
+                                          tma_buffer.get_sf_ptr(), kSFBytesPerToken);
                 }
 
-                // ----- 3. topk_idx (Region C; topk_idx_t = int64_t by default) -----
+                // 3. Region C: topk_idx — master writes the full kNumTopk row
                 {
                     auto* dst_topk_local = static_cast<topk_idx_t*>(
                         compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
-                    topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(dst_topk_local, dst_rank);
-                    if (sym_dst != nullptr and lane_idx < kNumTopk) {
-                        const auto my_expert_raw = __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
-                        const bool my_in_dst = (my_expert_raw >= 0)
-                            and (my_expert_raw / kNumExpertsPerRank == dst_rank);
-                        sym_dst[lane_idx] = my_in_dst
-                            ? static_cast<topk_idx_t>(my_expert_raw - dst_rank * kNumExpertsPerRank)
-                            : static_cast<topk_idx_t>(-1);
+                    topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(
+                        dst_topk_local, my_dst_rank);
+                    if (sym_dst != nullptr) {
+                        #pragma unroll
+                        for (int k = 0; k < kNumTopk; ++ k) {
+                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
+                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
+                            sym_dst[k] = in_dst
+                                ? static_cast<topk_idx_t>(raw - my_dst_rank * kNumExpertsPerRank)
+                                : static_cast<topk_idx_t>(-1);
+                        }
                     }
                 }
 
-                // ----- 4. topk_weights (Region D) -----
+                // 4. Region D: topk_weights — master writes the full kNumTopk row
                 if (topk_weights != nullptr) {
                     float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
                         compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
-                        dst_rank);
-                    if (sym_dst != nullptr and lane_idx < kNumTopk) {
-                        sym_dst[lane_idx] = topk_weights[token_idx * kNumTopk + lane_idx];
+                        my_dst_rank);
+                    if (sym_dst != nullptr) {
+                        #pragma unroll
+                        for (int k = 0; k < kNumTopk; ++ k)
+                            sym_dst[k] = __ldg(topk_weights + token_idx * kNumTopk + k);
                     }
                 }
 
-                // ----- 5. src_metadata (Region E) -----
+                // 5. Region E: src_metadata — master writes the full (2 + kNumTopk) row
                 {
                     int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
                         compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
-                        dst_rank);
+                        my_dst_rank);
                     if (sym_dst != nullptr) {
-                        if (lane_idx == 0) {
-                            sym_dst[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
-                            sym_dst[1] = rank_idx * kNumTopk + master_src_topk_idx;
-                        }
-                        if (lane_idx < kNumTopk) {
-                            const int my_expert_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
-                            const bool my_in_dst = (my_expert_raw >= 0)
-                                and (my_expert_raw / kNumExpertsPerRank == dst_rank);
-                            sym_dst[2 + lane_idx] = my_in_dst ? (my_expert_raw - dst_rank * kNumExpertsPerRank) : -1;
+                        sym_dst[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
+                        sym_dst[1] = rank_idx * kNumTopk + master_src_topk_idx;
+                        #pragma unroll
+                        for (int k = 0; k < kNumTopk; ++ k) {
+                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
+                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
+                            sym_dst[2 + k] = in_dst ? (raw - my_dst_rank * kNumExpertsPerRank) : -1;
                         }
                     }
                 }
@@ -512,23 +520,19 @@ dispatch_impl_fast_path(
             }
             __syncwarp();
 
-            // ----- Arrival counter: one lane per (token, dst_rank) bumps it -----
+            // Arrival counter on dst (one lane per unique dst)
             if (is_master_for_dst) {
                 int* sym_counter = gin_compact.template get_sym_ptr<team_t>(
-                    compact_layout.arrival_counter_ptr(rank_idx),
-                    dst_rank);
-                if (sym_counter != nullptr) {
+                    compact_layout.arrival_counter_ptr(rank_idx), my_dst_rank);
+                if (sym_counter != nullptr)
                     ptx::red_add_rel_sys(sym_counter, 1);
-                }
             }
             __syncwarp();
-
-            // Maintain copied_topk_idx for the EPHandle (host expects this).
-            if (copied_topk_idx != nullptr and warp_idx == 0 and sm_idx == 0 and lane_idx < kNumTopk) {
-                copied_topk_idx[token_idx * kNumTopk + lane_idx] =
-                    __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
-            }
         }
+
+        // Drain remaining TMA stores before final barrier
+        ptx::tma_store_wait();
+        __syncwarp();
     }
 
     // -----------------------------------------------------------------------
