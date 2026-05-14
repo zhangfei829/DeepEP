@@ -467,12 +467,12 @@ static void launch_dispatch_fast_path(void* x, void* sf,
         .rank_idx = rank_idx,
         .compact_buffer = compact_buffer,
         .compact_window = compact_window,
-        // Use cooperative=true to allow cooperative_groups::this_grid().sync()
-        // calls inside the kernel (gpu_barrier with kSyncAtStart=true requires it).
-        // cluster_dim=1 for simplicity; the legacy dispatch uses 2-(num_sms%2)
-        // for clustered overlap with compute, but fast path doesn't need that yet.
+        // Match legacy dispatch_impl launch attrs: cluster_dim = 2 - (num_sms % 2)
+        // so cp.async.bulk.shared::cluster.global (TMA load) sees a proper
+        // cluster context (legacy uses cluster_dim=2 on even num_sms).
         .launch_args = jit::LaunchArgs(num_sms, num_threads, fast_path_smem_bytes,
-                                       /*cluster_dim=*/1, /*cooperative=*/true)};
+                                       /*cluster_dim=*/2 - (num_sms % 2),
+                                       /*cooperative=*/true)};
     const auto code = DispatchFastPathRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch_fast_path", code);
     DispatchFastPathRuntime::launch(runtime, args, stream);
