@@ -1332,6 +1332,11 @@ public:
         }
 
         // Stream control
+        if (fast_path and nccl_context->rank_idx == 0) {
+            const auto e = cudaStreamSynchronize(comm_stream);
+            printf("[fp:dbg] after from_blob+slice sync: %s\n",
+                   e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+        }
         const auto event = stream_control_epilogue(
             {x, sf, topk_idx, topk_weights,
              recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
@@ -1346,6 +1351,12 @@ public:
              channel_linked_list},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
+
+        if (fast_path and nccl_context->rank_idx == 0) {
+            const auto e = cudaDeviceSynchronize();
+            printf("[fp:dbg] after stream_control_epilogue sync: %s\n",
+                   e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+        }
 
         return {recv_x, recv_sf,
                 recv_topk_idx, recv_topk_weights,
