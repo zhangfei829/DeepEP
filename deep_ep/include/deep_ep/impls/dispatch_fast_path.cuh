@@ -407,21 +407,18 @@ dispatch_impl_fast_path(
                     }
                 }
 
-                // ----- 3. topk_idx (Region C) -----
+                // ----- 3. topk_idx (Region C; topk_idx_t = int64_t by default) -----
                 {
-                    int* sym_dst = gin.template get_sym_ptr<team_t>(
-                        compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)),
-                        dst_rank);
-                    if (sym_dst != nullptr) {
-                        // Write the lane's local expert idx (-1 if out of dst rank).
-                        // 32 lanes write their value to topk slot lane_idx.
-                        if (lane_idx < kNumTopk) {
-                            // Re-evaluate per-lane: only this lane's own expert that falls in dst rank.
-                            const int my_expert_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
-                            const bool my_in_dst = (my_expert_raw >= 0)
-                                and (my_expert_raw / kNumExpertsPerRank == dst_rank);
-                            sym_dst[lane_idx] = my_in_dst ? (my_expert_raw - dst_rank * kNumExpertsPerRank) : -1;
-                        }
+                    auto* dst_topk_local = static_cast<topk_idx_t*>(
+                        compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
+                    topk_idx_t* sym_dst = gin.template get_sym_ptr<team_t, topk_idx_t>(dst_topk_local, dst_rank);
+                    if (sym_dst != nullptr and lane_idx < kNumTopk) {
+                        const auto my_expert_raw = __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
+                        const bool my_in_dst = (my_expert_raw >= 0)
+                            and (my_expert_raw / kNumExpertsPerRank == dst_rank);
+                        sym_dst[lane_idx] = my_in_dst
+                            ? static_cast<topk_idx_t>(my_expert_raw - dst_rank * kNumExpertsPerRank)
+                            : static_cast<topk_idx_t>(-1);
                     }
                 }
 

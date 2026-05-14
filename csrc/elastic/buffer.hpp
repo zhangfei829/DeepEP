@@ -59,16 +59,16 @@ class ElasticBuffer {
     // preconditions. ncclMemAlloc + ncclCommWindowRegister are collective, so
     // they must be called from inside dispatch() (all ranks at the same time).
     // Layout: see CompactRecvBufferLayout in layout.cuh (Regions A..G).
+    // `mutable` so that const dispatch() can lazily allocate on first use.
     // -------------------------------------------------------------------------
-    void*           compact_raw_ptr     = nullptr;
-    void*           compact_mapped_ptr  = nullptr;     // local LSA mapped (read by host + by epilogue-replacement)
-    ncclWindow_t    compact_window      = nullptr;
-    int64_t         compact_total_bytes = 0;
-    // Cached layout params; when these change, the buffer is reallocated.
-    int64_t         compact_n_max       = 0;
-    int64_t         compact_hidden_bytes = 0;
-    int64_t         compact_sf_bytes_per_token = 0;
-    int64_t         compact_num_topk    = 0;
+    mutable void*        compact_raw_ptr     = nullptr;
+    mutable void*        compact_mapped_ptr  = nullptr;
+    mutable ncclWindow_t compact_window      = nullptr;
+    mutable int64_t      compact_total_bytes = 0;
+    mutable int64_t      compact_n_max       = 0;
+    mutable int64_t      compact_hidden_bytes = 0;
+    mutable int64_t      compact_sf_bytes_per_token = 0;
+    mutable int64_t      compact_num_topk    = 0;
 
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
@@ -186,12 +186,13 @@ public:
     }
 
     // Ensure compact_window is allocated with at least this many bytes and the
-    // layout params match. Reallocates if config changed.
+    // layout params match. Reallocates if config changed.  `const` for use from
+    // const dispatch(); mutates only the mutable compact_* fields.
     void ensure_compact_recv_window(
             const int64_t& n_max,
             const int64_t& hidden_bytes,
             const int64_t& sf_bytes_per_token,
-            const int64_t& num_topk) {
+            const int64_t& num_topk) const {
         // If already allocated and config unchanged, reuse.
         if (compact_window != nullptr and
             compact_n_max == n_max and
@@ -230,6 +231,24 @@ public:
                    static_cast<long>(n_max), static_cast<long>(hidden_bytes),
                    static_cast<long>(sf_bytes_per_token), static_cast<long>(num_topk));
         }
+    }
+
+    // Fast-path eligibility:
+    //   * env DEEPEP_FAST_PATH=1
+    //   * intra-NVL72 (num_scaleout_ranks == 1)
+    //   * non-expand mode
+    //   * non-cached mode (first dispatch)
+    //   * non-deterministic
+    bool is_fast_path_dispatch(const bool& do_expand,
+                               const bool& cached_mode,
+                               const bool& is_deterministic_flag) const {
+        const int env_enable = get_env<int>("DEEPEP_FAST_PATH", 0);
+        if (not env_enable) return false;
+        if (do_expand) return false;
+        if (cached_mode) return false;
+        if (is_deterministic_flag) return false;
+        if (nccl_context->num_scaleout_ranks != 1) return false;
+        return true;
     }
 
     void destroy_compact_recv_window() {
@@ -1010,29 +1029,63 @@ public:
 
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
-        launch_dispatch(x.data_ptr(), sf_ptr,
-                        topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
-                        copied_topk_idx_ptr,
-                        cumulative_local_expert_recv_stats_ptr,
-                        psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-                        psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                        dst_buffer_slot_idx.data_ptr<int>(),
-                        token_metadata_at_forward_ptr,
-                        num_tokens, num_max_tokens_per_rank,
-                        hidden, x.element_size(),
-                        num_sf_packs, sf_token_stride, sf_hidden_stride,
-                        num_experts, num_topk, expert_alignment,
-                        nccl_context->dev_comm, nccl_context->window,
-                        buffer,
-                        workspace, mapped_host_workspace,
-                        nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
-                        nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                        nccl_context->is_scaleup_nvlink,
-                        num_sms, num_channels_per_sm,
-                        num_smem_bytes,
-                        num_qps, num_gpu_timeout_cycles,
-                        cached_mode, deterministic, do_cpu_sync,
-                        comm_stream);
+
+        // ----- Fast-path eligibility check -----
+        const bool fast_path = is_fast_path_dispatch(do_expand, cached_mode, deterministic);
+        if (fast_path) {
+            // Lazy-allocate compact_recv_window (collective on first call).
+            ensure_compact_recv_window(num_max_tokens_per_rank, num_hidden_bytes,
+                                       num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
+                                       num_topk);
+            launch_dispatch_fast_path(x.data_ptr(), sf_ptr,
+                                      topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
+                                      copied_topk_idx_ptr,
+                                      cumulative_local_expert_recv_stats_ptr,
+                                      psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                                      psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                                      dst_buffer_slot_idx.data_ptr<int>(),
+                                      num_tokens, num_max_tokens_per_rank,
+                                      hidden, x.element_size(),
+                                      num_sf_packs, sf_token_stride, sf_hidden_stride,
+                                      num_experts, num_topk, expert_alignment,
+                                      nccl_context->dev_comm, nccl_context->window,
+                                      buffer,
+                                      workspace, mapped_host_workspace,
+                                      nccl_context->scaleup_rank_idx,
+                                      nccl_context->num_scaleup_ranks,
+                                      nccl_context->is_scaleup_nvlink,
+                                      num_sms,
+                                      num_smem_bytes,
+                                      num_qps, num_gpu_timeout_cycles,
+                                      do_cpu_sync,
+                                      compact_mapped_ptr,
+                                      compact_window,
+                                      comm_stream);
+        } else {
+            launch_dispatch(x.data_ptr(), sf_ptr,
+                            topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
+                            copied_topk_idx_ptr,
+                            cumulative_local_expert_recv_stats_ptr,
+                            psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                            psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                            dst_buffer_slot_idx.data_ptr<int>(),
+                            token_metadata_at_forward_ptr,
+                            num_tokens, num_max_tokens_per_rank,
+                            hidden, x.element_size(),
+                            num_sf_packs, sf_token_stride, sf_hidden_stride,
+                            num_experts, num_topk, expert_alignment,
+                            nccl_context->dev_comm, nccl_context->window,
+                            buffer,
+                            workspace, mapped_host_workspace,
+                            nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                            nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                            nccl_context->is_scaleup_nvlink,
+                            num_sms, num_channels_per_sm,
+                            num_smem_bytes,
+                            num_qps, num_gpu_timeout_cycles,
+                            cached_mode, deterministic, do_cpu_sync,
+                            comm_stream);
+        }
 
         // Received token counters
         int num_recv_tokens = 0, num_expanded_tokens = 0;
@@ -1107,13 +1160,41 @@ public:
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
-        auto recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
         auto recv_sf = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>();
         auto recv_topk_weights = std::optional<torch::Tensor>();
-        auto recv_src_metadata = torch::empty(
-            {num_recv_tokens, num_topk + 2},
-            torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+
+        // Fast path: wrap compact_recv_window regions with from_blob (no-copy).
+        // Otherwise: allocate fresh PyTorch tensors (legacy behaviour).
+        torch::Tensor recv_x;
+        torch::Tensor recv_src_metadata;
+        if (fast_path) {
+            const auto compact_layout = get_compact_layout(
+                num_max_tokens_per_rank, num_hidden_bytes,
+                num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
+                num_topk);
+            const auto no_op_deleter = [](void*) {};
+            void* base = compact_mapped_ptr;
+
+            // Region A: hidden
+            recv_x = torch::from_blob(
+                static_cast<int8_t*>(base) + compact_layout.offset_A(),
+                {num_allocated_tokens, hidden},
+                no_op_deleter,
+                x.options());
+
+            // Region E: src_metadata
+            recv_src_metadata = torch::from_blob(
+                static_cast<int8_t*>(base) + compact_layout.offset_E(),
+                {num_recv_tokens, num_topk + 2},
+                no_op_deleter,
+                torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+        } else {
+            recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+            recv_src_metadata = torch::empty(
+                {num_recv_tokens, num_topk + 2},
+                torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+        }
 
         // Optional tensors
         void* recv_sf_ptr = nullptr;
@@ -1127,19 +1208,66 @@ public:
                 // TMA-aligned layout for the next GEMM input
                 recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_allocated_tokens, kNumAlignedSFPacks);
             }
-            recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
-                                           {recv_sf_token_stride, recv_sf_hidden_stride},
-                                           sf->options());
+            if (fast_path) {
+                // Fast path SF is packed contiguous (stride = num_sf_packs, 1).
+                // We don't currently support col-major TMA-aligned in fast path.
+                EP_HOST_ASSERT(not use_tma_aligned_col_major_sf and
+                               "use_tma_aligned_col_major_sf is not supported in fast path yet");
+                const auto compact_layout = get_compact_layout(
+                    num_max_tokens_per_rank, num_hidden_bytes,
+                    num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
+                    num_topk);
+                const auto no_op_deleter = [](void*) {};
+                recv_sf = torch::from_blob(
+                    static_cast<int8_t*>(compact_mapped_ptr) + compact_layout.offset_B(),
+                    {num_allocated_tokens, num_sf_packs},
+                    no_op_deleter,
+                    sf->options());
+            } else {
+                recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
+                                               {recv_sf_token_stride, recv_sf_hidden_stride},
+                                               sf->options());
+            }
             recv_sf_ptr = recv_sf->data_ptr();
         }
         if (not do_expand) {
-            recv_topk_idx = torch::empty({num_allocated_tokens, num_topk}, topk_idx.options());
+            if (fast_path) {
+                const auto compact_layout = get_compact_layout(
+                    num_max_tokens_per_rank, num_hidden_bytes,
+                    num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
+                    num_topk);
+                const auto no_op_deleter = [](void*) {};
+                // Region C is sized for sizeof(int64_t) entries; assert match.
+                EP_HOST_ASSERT(sizeof(topk_idx_t) == sizeof(int64_t) and
+                               "Fast path Region C currently assumes sizeof(topk_idx_t) == 8");
+                recv_topk_idx = torch::from_blob(
+                    static_cast<int8_t*>(compact_mapped_ptr) + compact_layout.offset_C(),
+                    {num_allocated_tokens, num_topk},
+                    no_op_deleter,
+                    topk_idx.options());
+            } else {
+                recv_topk_idx = torch::empty({num_allocated_tokens, num_topk}, topk_idx.options());
+            }
             recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
         }
         if (topk_weights.has_value()) {
-            recv_topk_weights = do_expand ?
-                torch::empty({num_allocated_tokens}, topk_weights->options()) :
-                torch::empty({num_allocated_tokens, num_topk}, topk_weights->options());
+            if (fast_path) {
+                EP_HOST_ASSERT(not do_expand);
+                const auto compact_layout = get_compact_layout(
+                    num_max_tokens_per_rank, num_hidden_bytes,
+                    num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
+                    num_topk);
+                const auto no_op_deleter = [](void*) {};
+                recv_topk_weights = torch::from_blob(
+                    static_cast<int8_t*>(compact_mapped_ptr) + compact_layout.offset_D(),
+                    {num_allocated_tokens, num_topk},
+                    no_op_deleter,
+                    topk_weights->options());
+            } else {
+                recv_topk_weights = do_expand ?
+                    torch::empty({num_allocated_tokens}, topk_weights->options()) :
+                    torch::empty({num_allocated_tokens, num_topk}, topk_weights->options());
+            }
             recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
         }
 
@@ -1154,26 +1282,29 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
-        // Launch copy kernels with full SMs
+        // Launch copy kernels with full SMs (skipped in fast path -- fast path
+        // dispatch_impl_fast_path writes recv_* tensors directly).
         stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_dispatch_copy_epilogue(buffer, workspace,
-                                      psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-                                      psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      recv_x.data_ptr(), recv_sf_ptr,
-                                      recv_topk_idx_ptr, recv_topk_weights_ptr,
-                                      recv_src_metadata.data_ptr<int>(),
-                                      channel_linked_list_ptr,
-                                      num_recv_tokens, num_max_tokens_per_rank,
-                                      num_hidden_bytes,
-                                      num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
-                                      num_experts, num_topk,
-                                      nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
-                                      nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                                      jit::device_runtime->get_num_sms(),
-                                      jit::device_runtime->get_num_smem_bytes(),
-                                      num_channels,
-                                      do_expand, cached_mode,
-                                      comm_stream);
+        if (not fast_path) {
+            launch_dispatch_copy_epilogue(buffer, workspace,
+                                          psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                                          psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                                          recv_x.data_ptr(), recv_sf_ptr,
+                                          recv_topk_idx_ptr, recv_topk_weights_ptr,
+                                          recv_src_metadata.data_ptr<int>(),
+                                          channel_linked_list_ptr,
+                                          num_recv_tokens, num_max_tokens_per_rank,
+                                          num_hidden_bytes,
+                                          num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
+                                          num_experts, num_topk,
+                                          nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                                          nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                                          jit::device_runtime->get_num_sms(),
+                                          jit::device_runtime->get_num_smem_bytes(),
+                                          num_channels,
+                                          do_expand, cached_mode,
+                                          comm_stream);
+        }
 
         // Stream control
         const auto event = stream_control_epilogue(

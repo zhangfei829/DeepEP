@@ -375,7 +375,12 @@ struct CompactRecvBufferLayout {
 
     __forceinline__ __device__ __host__
     int64_t get_region_C_bytes() const {
-        return math::align<int64_t>(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(int)),
+        // Region C stores recv_topk_idx[N_recv, num_topk] in topk_idx_t units
+        // (default int64).  The size is computed at runtime since topk_idx_t
+        // is a typedef and we can't use sizeof(topk_idx_t) in a generic helper.
+        // Caller passes `topk_idx_size_bytes` via the dedicated overload below
+        // if non-default sizes are needed; here we assume sizeof(int64_t).
+        return math::align<int64_t>(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(int64_t)),
                                     static_cast<int64_t>(ptx::kNumTMAAlignBytes));
     }
 
@@ -429,10 +434,12 @@ struct CompactRecvBufferLayout {
         return reinterpret_cast<sf_pack_t*>(
             static_cast<int8_t*>(base) + offset_B() + compact_idx * sf_bytes_per_token);
     }
+    // Region C entries are sizeof(int64_t) wide (= sizeof(topk_idx_t) for the
+    // default 64-bit config). Caller reinterprets the returned void* into
+    // topk_idx_t* (int64_t*).
     __forceinline__ __device__ __host__
-    int* topk_idx_ptr(const int64_t& compact_idx) const {
-        return reinterpret_cast<int*>(
-            static_cast<int8_t*>(base) + offset_C() + compact_idx * num_topk * sizeof(int));
+    void* topk_idx_ptr(const int64_t& compact_idx) const {
+        return static_cast<int8_t*>(base) + offset_C() + compact_idx * num_topk * sizeof(int64_t);
     }
     __forceinline__ __device__ __host__
     float* topk_weights_ptr(const int64_t& compact_idx) const {
