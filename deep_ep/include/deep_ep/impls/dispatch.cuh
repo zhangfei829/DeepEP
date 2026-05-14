@@ -14,6 +14,12 @@
 
 namespace deep_ep::elastic {
 
+// kFastPath (default = false): when true, the dispatch_copy_epilogue kernel
+// is skipped and recv buffers are written in compact layout straight into
+// compact_recv_window (Regions A..E). Currently only valid for non-expand +
+// intra-NVL72 (scaleout=1) at host-side routing time; the kernel-internal
+// changes for fast path live in #ifdef-style `if constexpr (kFastPath)`
+// branches and land in a follow-up commit. Default false = legacy behaviour.
 template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
@@ -24,6 +30,7 @@ template <bool kIsScaleupNVLink,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          bool kFastPath = false,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumDispatchThreads = kNumDispatchWarps * 32,
           int kNumThreads = kNumNotifyThreads + kNumDispatchThreads,
