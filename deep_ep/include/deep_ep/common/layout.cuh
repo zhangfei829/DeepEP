@@ -311,4 +311,158 @@ struct BufferLayout {
     }
 };
 
+// =============================================================================
+// CompactRecvBufferLayout: Region-based, NO-COPY dispatch (fast path)
+// =============================================================================
+//
+// Layout used by the fast-path dispatch (non-expand + intra-NVL72). Replaces
+// the legacy "per-src-rank packed token slot" layout with five compact
+// per-(N_recv) regions, written directly by the src-side dispatch warps:
+//
+//   Region A: hidden          [N_max * N_ranks, hidden]   <dtype>
+//   Region B: sf              [N_max * N_ranks, num_sf_packs]   sf_pack_t
+//   Region C: topk_idx        [N_max * N_ranks, num_topk]       int32   (local expert idx)
+//   Region D: topk_weights    [N_max * N_ranks, num_topk]       float
+//   Region E: src_metadata    [N_max * N_ranks, num_topk + 2]   int32
+//   Region F: arrival counter [N_ranks]                          int32   (dst-side; how many tokens from src=i arrived)
+//   Region G: peer_psum_buf   [N_ranks, N_ranks]                 int32   (src-side; per (dst, src_seen_in_dst) prefix sum, broadcast by dst)
+//
+// Each region is `ptx::kNumTMAAlignBytes`-aligned. `compact_window` is a
+// single ncclWindow_t covering all six regions in this order.
+//
+// `recv_x`, `recv_sf`, `recv_topk_idx`, `recv_topk_weights`, `recv_src_metadata`
+// in the Python API are `torch::from_blob(...)` views of Region A..E with the
+// natural strides documented above (no extra copy).
+struct CompactRecvBufferLayout {
+    int64_t num_max_tokens_per_rank;
+    int64_t num_ranks;
+    int64_t hidden_bytes;        // sizeof(dtype) * hidden
+    int64_t sf_bytes_per_token;  // sizeof(sf_pack_t) * num_sf_packs (0 for bf16)
+    int64_t num_topk;
+    void*   base;                // start of the registered ncclWindow buffer (host side)
+
+    __forceinline__ __device__ __host__
+    CompactRecvBufferLayout(const int64_t& num_max_tokens_per_rank,
+                            const int64_t& num_ranks,
+                            const int64_t& hidden_bytes,
+                            const int64_t& sf_bytes_per_token,
+                            const int64_t& num_topk,
+                            void* base = nullptr) :
+        num_max_tokens_per_rank(num_max_tokens_per_rank),
+        num_ranks(num_ranks),
+        hidden_bytes(hidden_bytes),
+        sf_bytes_per_token(sf_bytes_per_token),
+        num_topk(num_topk),
+        base(base) {}
+
+    __forceinline__ __device__ __host__
+    int64_t get_max_tokens() const {
+        return num_max_tokens_per_rank * num_ranks;
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_region_A_bytes() const {
+        return math::align(get_max_tokens() * hidden_bytes, ptx::kNumTMAAlignBytes);
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_region_B_bytes() const {
+        return math::align(get_max_tokens() * sf_bytes_per_token, ptx::kNumTMAAlignBytes);
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_region_C_bytes() const {
+        return math::align(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(int)),
+                           ptx::kNumTMAAlignBytes);
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_region_D_bytes() const {
+        return math::align(get_max_tokens() * num_topk * static_cast<int64_t>(sizeof(float)),
+                           ptx::kNumTMAAlignBytes);
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_region_E_bytes() const {
+        return math::align(get_max_tokens() * (num_topk + 2) * static_cast<int64_t>(sizeof(int)),
+                           ptx::kNumTMAAlignBytes);
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_region_F_bytes() const {
+        return math::align(num_ranks * static_cast<int64_t>(sizeof(int)),
+                           ptx::kNumTMAAlignBytes);
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_region_G_bytes() const {
+        return math::align(num_ranks * num_ranks * static_cast<int64_t>(sizeof(int)),
+                           ptx::kNumTMAAlignBytes);
+    }
+
+    __forceinline__ __device__ __host__
+    int64_t get_total_bytes() const {
+        return get_region_A_bytes() + get_region_B_bytes() + get_region_C_bytes()
+             + get_region_D_bytes() + get_region_E_bytes()
+             + get_region_F_bytes() + get_region_G_bytes();
+    }
+
+    // Region offsets (within `base`).
+    __forceinline__ __device__ __host__ int64_t offset_A() const { return 0; }
+    __forceinline__ __device__ __host__ int64_t offset_B() const { return offset_A() + get_region_A_bytes(); }
+    __forceinline__ __device__ __host__ int64_t offset_C() const { return offset_B() + get_region_B_bytes(); }
+    __forceinline__ __device__ __host__ int64_t offset_D() const { return offset_C() + get_region_C_bytes(); }
+    __forceinline__ __device__ __host__ int64_t offset_E() const { return offset_D() + get_region_D_bytes(); }
+    __forceinline__ __device__ __host__ int64_t offset_F() const { return offset_E() + get_region_E_bytes(); }
+    __forceinline__ __device__ __host__ int64_t offset_G() const { return offset_F() + get_region_F_bytes(); }
+
+    // Per-token pointer helpers (compact_idx in [0, N_max * N_ranks)).
+    __forceinline__ __device__ __host__
+    void* hidden_ptr(const int64_t& compact_idx) const {
+        return static_cast<int8_t*>(base) + offset_A() + compact_idx * hidden_bytes;
+    }
+    __forceinline__ __device__ __host__
+    sf_pack_t* sf_ptr(const int64_t& compact_idx) const {
+        return reinterpret_cast<sf_pack_t*>(
+            static_cast<int8_t*>(base) + offset_B() + compact_idx * sf_bytes_per_token);
+    }
+    __forceinline__ __device__ __host__
+    int* topk_idx_ptr(const int64_t& compact_idx) const {
+        return reinterpret_cast<int*>(
+            static_cast<int8_t*>(base) + offset_C() + compact_idx * num_topk * sizeof(int));
+    }
+    __forceinline__ __device__ __host__
+    float* topk_weights_ptr(const int64_t& compact_idx) const {
+        return reinterpret_cast<float*>(
+            static_cast<int8_t*>(base) + offset_D() + compact_idx * num_topk * sizeof(float));
+    }
+    __forceinline__ __device__ __host__
+    int* src_metadata_ptr(const int64_t& compact_idx) const {
+        return reinterpret_cast<int*>(
+            static_cast<int8_t*>(base) + offset_E() + compact_idx * (num_topk + 2) * sizeof(int));
+    }
+
+    // Region F: per-(src_rank) arrival counter, on dst side.
+    __forceinline__ __device__ __host__
+    int* arrival_counter_ptr(const int& src_rank_idx) const {
+        return reinterpret_cast<int*>(
+            static_cast<int8_t*>(base) + offset_F() + src_rank_idx * sizeof(int));
+    }
+
+    // Region G: peer_psum_buf[dst_rank, src_rank] = "in dst_rank's view,
+    // cumulative count of tokens from src ranks 0..src_rank-1 to dst_rank".
+    // Used by src side to compute its compact_idx within dst's RECV buffer.
+    __forceinline__ __device__ __host__
+    int* peer_psum_ptr(const int& dst_rank_idx, const int& src_rank_idx) const {
+        return reinterpret_cast<int*>(
+            static_cast<int8_t*>(base) + offset_G()
+            + (static_cast<int64_t>(dst_rank_idx) * num_ranks + src_rank_idx) * sizeof(int));
+    }
+
+    __forceinline__ __device__ __host__
+    int* peer_psum_row_ptr(const int& dst_rank_idx) const {
+        return peer_psum_ptr(dst_rank_idx, 0);
+    }
+};
+
 }  // namespace deep_ep::elastic

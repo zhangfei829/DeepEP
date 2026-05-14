@@ -7,6 +7,7 @@
 
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/exception.cuh>
 
 #include "../kernels/backend/api.cuh"
 #include "../kernels/elastic/api.hpp"
@@ -51,6 +52,23 @@ class ElasticBuffer {
 
     // NCCL context
     std::shared_ptr<nccl::NCCLSymmetricMemoryContext> nccl_context;
+
+    // -------------------------------------------------------------------------
+    // Fast-path RECV BUFFER (non-expand + intra-NVL72 only).
+    // Lazily allocated on first dispatch() call that satisfies the fast-path
+    // preconditions. ncclMemAlloc + ncclCommWindowRegister are collective, so
+    // they must be called from inside dispatch() (all ranks at the same time).
+    // Layout: see CompactRecvBufferLayout in layout.cuh (Regions A..G).
+    // -------------------------------------------------------------------------
+    void*           compact_raw_ptr     = nullptr;
+    void*           compact_mapped_ptr  = nullptr;     // local LSA mapped (read by host + by epilogue-replacement)
+    ncclWindow_t    compact_window      = nullptr;
+    int64_t         compact_total_bytes = 0;
+    // Cached layout params; when these change, the buffer is reallocated.
+    int64_t         compact_n_max       = 0;
+    int64_t         compact_hidden_bytes = 0;
+    int64_t         compact_sf_bytes_per_token = 0;
+    int64_t         compact_num_topk    = 0;
 
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
@@ -143,11 +161,90 @@ public:
         // Deallocate host workspaces
         CUDA_RUNTIME_CHECK(cudaFreeHost(host_workspace));
 
+        // Release fast-path compact window (collective: dereg + free)
+        destroy_compact_recv_window();
+
         // Destroy NCCL context
         nccl_context->finalize();
 
         // Cannot use anymore
         destroyed = true;
+    }
+
+    // -------------------------------------------------------------------------
+    // Fast-path RECV BUFFER management (lazy, collective).
+    // -------------------------------------------------------------------------
+    layout::CompactRecvBufferLayout get_compact_layout(
+            const int64_t& n_max,
+            const int64_t& hidden_bytes,
+            const int64_t& sf_bytes_per_token,
+            const int64_t& num_topk) const {
+        return layout::CompactRecvBufferLayout(
+            n_max, nccl_context->num_ranks,
+            hidden_bytes, sf_bytes_per_token, num_topk,
+            compact_mapped_ptr);
+    }
+
+    // Ensure compact_window is allocated with at least this many bytes and the
+    // layout params match. Reallocates if config changed.
+    void ensure_compact_recv_window(
+            const int64_t& n_max,
+            const int64_t& hidden_bytes,
+            const int64_t& sf_bytes_per_token,
+            const int64_t& num_topk) {
+        // If already allocated and config unchanged, reuse.
+        if (compact_window != nullptr and
+            compact_n_max == n_max and
+            compact_hidden_bytes == hidden_bytes and
+            compact_sf_bytes_per_token == sf_bytes_per_token and
+            compact_num_topk == num_topk) {
+            return;
+        }
+
+        // Reallocate (collective).
+        destroy_compact_recv_window();
+
+        const auto probe = layout::CompactRecvBufferLayout(
+            n_max, nccl_context->num_ranks, hidden_bytes, sf_bytes_per_token, num_topk, nullptr);
+        compact_total_bytes = probe.get_total_bytes();
+        // 16-byte aligned by construction (all regions align(_, kNumTMAAlignBytes)).
+        NCCL_CHECK(ncclMemAlloc(&compact_raw_ptr, compact_total_bytes));
+        NCCL_CHECK(ncclCommWindowRegister(nccl_context->comm, compact_raw_ptr, compact_total_bytes,
+                                          &compact_window, NCCL_WIN_DEFAULT));
+        NCCL_CHECK(ncclGetLsaDevicePointer(compact_window, 0, nccl_context->nvl_rank_idx, &compact_mapped_ptr));
+
+        // Cache config.
+        compact_n_max               = n_max;
+        compact_hidden_bytes        = hidden_bytes;
+        compact_sf_bytes_per_token  = sf_bytes_per_token;
+        compact_num_topk            = num_topk;
+
+        // Zero-initialize Region F (arrival counters) and Region G (peer_psum_buf).
+        // Easier to memset entire buffer than to compute offsets in host code.
+        // Done on comm_stream so all ranks see zero before they read.
+        CUDA_RUNTIME_CHECK(cudaMemsetAsync(compact_mapped_ptr, 0, compact_total_bytes, comm_stream));
+
+        if (get_env<int>("EP_BUFFER_DEBUG")) {
+            printf("[DeepEP] compact_recv_window allocated: %.2f MB (n_max=%ld hidden=%ld sf=%ld topk=%ld)\n",
+                   compact_total_bytes / (1024.0 * 1024.0),
+                   static_cast<long>(n_max), static_cast<long>(hidden_bytes),
+                   static_cast<long>(sf_bytes_per_token), static_cast<long>(num_topk));
+        }
+    }
+
+    void destroy_compact_recv_window() {
+        if (compact_window != nullptr) {
+            NCCL_CHECK(ncclCommWindowDeregister(nccl_context->comm, compact_window));
+            NCCL_CHECK(ncclMemFree(compact_raw_ptr));
+            compact_raw_ptr = nullptr;
+            compact_mapped_ptr = nullptr;
+            compact_window = nullptr;
+            compact_total_bytes = 0;
+            compact_n_max = 0;
+            compact_hidden_bytes = 0;
+            compact_sf_bytes_per_token = 0;
+            compact_num_topk = 0;
+        }
     }
 
     torch::Stream get_comm_stream() const {
