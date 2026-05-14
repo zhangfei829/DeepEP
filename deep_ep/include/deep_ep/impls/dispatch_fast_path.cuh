@@ -372,13 +372,23 @@ dispatch_impl_fast_path(
             // used in src_metadata to point back at the originating topk slot.
             const int master_src_topk_idx = ptx::get_master_lane_idx(ptx::gather(is_master_for_dst));
 
-            // Pull src-local sequence number from dst_buffer_slot_idx (assigned in prologue).
-            // Note: dst_buffer_slot_idx[token_idx, topk_lane] is the slot number THIS src has
-            // assigned for this (token, topk) under the LEGACY rank-slot layout, but its value
-            // is exactly "this is my k-th token to dst_rank" which matches what we need for the
-            // compact offset.
-            const int my_local_seq_to_dst = (topk_lane >= 0 and in_range) ?
-                __ldg(dst_buffer_slot_idx + token_idx * kNumTopk + topk_lane) : -1;
+            // Allocate src-local sequence number for (this_src -> dst_rank) via atomic counter
+            // on workspace. NOTE: dst_buffer_slot_idx is uninitialized in fast-path mode
+            // (no deterministic prologue), so we MUST compute the slot ourselves here.
+            int my_local_seq_to_dst = -1;
+            if (is_master_for_dst) {
+                my_local_seq_to_dst = atomicAdd(
+                    workspace_layout.get_scaleup_atomic_sender_counter() + dst_rank, 1);
+            }
+
+            // Also record into dst_buffer_slot_idx so combine() can route reverse.
+            // Format matches legacy: rank_idx * kNumMaxTokensPerRank + local_seq, or -1.
+            if (lane_idx < kNumTopk) {
+                const auto val = my_local_seq_to_dst >= 0
+                    ? (rank_idx * kNumMaxTokensPerRank + my_local_seq_to_dst) : -1;
+                dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx] = val;
+            }
+            __syncwarp();
 
             if (is_master_for_dst) {
                 // Compact tensor index on dst rank.
@@ -518,6 +528,12 @@ dispatch_impl_fast_path(
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
                       comm::kDispatchTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+
+    // Reset workspace atomic sender counters (one per dst rank) so the next
+    // dispatch() call starts from 0.  Same as legacy dispatch_impl end.
+    EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+    if (sm_idx == 0 and thread_idx < kNumRanks)
+        workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
 }
 
 }  // namespace deep_ep::elastic
