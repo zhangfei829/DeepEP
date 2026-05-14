@@ -404,6 +404,10 @@ dispatch_impl_fast_path(
         const auto stride      = total_warps * kNumSMs;
 
         for (int token_idx = warp_global; token_idx < num_tokens; token_idx += stride) {
+            const bool debug_first = (rank_idx == 0 and sm_idx == 0 and warp_idx == 0
+                                      and token_idx == warp_global and lane_idx == 0);
+            if (debug_first) printf("[fp:ph2] tok=0 enter\n");
+
             // Each lane (lane_idx in [0, 32)) handles topk slot lane_idx (only first kNumTopk are valid).
             const int  topk_lane         = lane_idx < kNumTopk ? lane_idx : -1;
             const int  raw_expert        = topk_lane >= 0 ?
@@ -427,6 +431,7 @@ dispatch_impl_fast_path(
                 my_local_seq_to_dst = atomicAdd(
                     workspace_layout.get_scaleup_atomic_sender_counter() + dst_rank, 1);
             }
+            if (debug_first) printf("[fp:ph2] tok=0 after atomic alloc\n");
 
             // Also record into dst_buffer_slot_idx so combine() can route reverse.
             // Format matches legacy: rank_idx * kNumMaxTokensPerRank + local_seq, or -1.
@@ -436,11 +441,15 @@ dispatch_impl_fast_path(
                 dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx] = val;
             }
             __syncwarp();
+            if (debug_first) printf("[fp:ph2] tok=0 after dst_buffer_slot_idx\n");
 
             if (is_master_for_dst) {
                 // Compact tensor index on dst rank.
                 const int compact_idx = s_my_compact_base[dst_rank] + my_local_seq_to_dst;
                 EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
+                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx == warp_global)
+                    printf("[fp:ph2] tok=0 master lane=%d dst_rank=%d local_seq=%d compact_idx=%d\n",
+                           lane_idx, dst_rank, my_local_seq_to_dst, compact_idx);
 
                 // ----- 1. hidden (Region A) -----
                 // NOTE: cp.async.bulk.global.shared::cta (used by tma_store_1d)
@@ -464,6 +473,8 @@ dispatch_impl_fast_path(
                             dst_v[k] = __ldg(src_v + k);
                     }
                 }
+                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx == warp_global)
+                    printf("[fp:ph2] tok=0 master lane=%d after hidden\n", lane_idx);
 
                 // ----- 2. sf (Region B), only when sf is present -----
                 if constexpr (kNumSFPacks > 0) {
@@ -491,6 +502,8 @@ dispatch_impl_fast_path(
                             : static_cast<topk_idx_t>(-1);
                     }
                 }
+                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx == warp_global)
+                    printf("[fp:ph2] tok=0 master lane=%d after topk_idx\n", lane_idx);
 
                 // ----- 4. topk_weights (Region D) -----
                 if (topk_weights != nullptr) {
@@ -501,6 +514,8 @@ dispatch_impl_fast_path(
                         sym_dst[lane_idx] = topk_weights[token_idx * kNumTopk + lane_idx];
                     }
                 }
+                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx == warp_global)
+                    printf("[fp:ph2] tok=0 master lane=%d after topk_weights\n", lane_idx);
 
                 // ----- 5. src_metadata (Region E) -----
                 {
@@ -520,9 +535,12 @@ dispatch_impl_fast_path(
                         }
                     }
                 }
+                if (rank_idx == 0 and sm_idx == 0 and warp_idx == 0 and token_idx == warp_global)
+                    printf("[fp:ph2] tok=0 master lane=%d after src_metadata\n", lane_idx);
                 // No TMA in-flight in fast path; commit_group is a no-op here.
             }
             __syncwarp();
+            if (debug_first) printf("[fp:ph2] tok=0 after stores syncwarp\n");
 
             // ----- Arrival counter: one lane per (token, dst_rank) bumps it -----
             if (is_master_for_dst) {
@@ -534,6 +552,7 @@ dispatch_impl_fast_path(
                 }
             }
             __syncwarp();
+            if (debug_first) printf("[fp:ph2] tok=0 after arrival counter\n");
 
             // Maintain copied_topk_idx for the EPHandle (host expects this).
             if (copied_topk_idx != nullptr and warp_idx == 0 and sm_idx == 0 and lane_idx < kNumTopk) {
