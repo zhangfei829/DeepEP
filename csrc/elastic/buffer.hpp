@@ -1048,6 +1048,12 @@ public:
             ensure_compact_recv_window(num_max_tokens_per_rank, num_hidden_bytes,
                                        num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
                                        num_topk);
+            // DEBUG: pre-launch sync to surface any pending sticky errors.
+            {
+                const auto e = cudaStreamSynchronize(comm_stream);
+                if (e != cudaSuccess and nccl_context->rank_idx == 0)
+                    printf("[fp:dbg] PRE-launch sync error: %s\n", cudaGetErrorString(e));
+            }
             launch_dispatch_fast_path(x.data_ptr(), sf_ptr,
                                       topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
                                       copied_topk_idx_ptr,
@@ -1072,6 +1078,14 @@ public:
                                       compact_mapped_ptr,
                                       compact_window,
                                       comm_stream);
+            // DEBUG: post-launch sync; if fast-path kernel had any async illegal
+            // access this will surface it here (instead of at the next CUDA API call).
+            {
+                const auto e = cudaStreamSynchronize(comm_stream);
+                if (nccl_context->rank_idx == 0)
+                    printf("[fp:dbg] POST-launch sync: %s\n",
+                           e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+            }
         } else {
             launch_dispatch(x.data_ptr(), sf_ptr,
                             topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
