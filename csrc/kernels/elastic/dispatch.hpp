@@ -306,6 +306,168 @@ static void launch_dispatch(void* x, void* sf,
     DispatchRuntime::launch(runtime, args, stream);
 }
 
+// ------------------------------------------------------------------------------------
+// FastPath dispatch (non-expand + intra-NVL72) — single-kernel no-copy variant.
+// ------------------------------------------------------------------------------------
+class DispatchFastPathRuntime final : public jit::LaunchRuntime<DispatchFastPathRuntime> {
+public:
+    struct Args {
+        // Templated arguments (mirrors a subset of DispatchRuntime + fast-path additions)
+        bool is_scaleup_nvlink;
+        bool do_cpu_sync;
+        int  num_notify_warps;
+        int  num_dispatch_warps;
+        int  num_ranks;            // = num_scaleup_ranks (fast path is scaleout=1)
+        int  num_hidden_bytes;
+        int  num_sf_packs;
+        int  num_max_tokens_per_rank;
+        int  num_experts, num_topk, expert_alignment;
+        int  num_qps;
+        int64_t num_timeout_cycles;
+
+        // Runtime args
+        void*       x;
+        sf_pack_t*  sf;
+        topk_idx_t* topk_idx;
+        float*      topk_weights;
+        topk_idx_t* copied_topk_idx;
+        int*        cumulative_local_expert_recv_stats;
+        int*        psum_num_recv_tokens_per_scaleup_rank;
+        int*        psum_num_recv_tokens_per_expert;
+        int*        dst_buffer_slot_idx;
+        int         num_tokens;
+        int         sf_token_stride, sf_hidden_stride;
+        ncclDevComm_t nccl_dev_comm;
+        ncclWindow_t  nccl_window;
+        void*       buffer;
+        void*       workspace;
+        void*       mapped_host_workspace;
+        int         rank_idx;
+        // Fast-path additions
+        void*       compact_buffer;
+        ncclWindow_t compact_window;
+
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        const auto func_name = fmt::format(
+            "dispatch_impl_fast_path<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            args.is_scaleup_nvlink,
+            args.do_cpu_sync,
+            args.launch_args.grid_dim.first,
+            args.num_notify_warps, args.num_dispatch_warps,
+            args.num_ranks,
+            args.num_hidden_bytes, args.num_sf_packs,
+            args.num_max_tokens_per_rank,
+            args.num_experts, args.num_topk, args.expert_alignment,
+            args.num_qps, args.num_timeout_cycles);
+
+        return fmt::format(R"(
+#include <deep_ep/impls/dispatch_fast_path.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&{});
+}}
+)", func_name);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel,
+                            const jit::LaunchConfigHandle& config, Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.x, args.sf, args.topk_idx, args.topk_weights,
+            args.copied_topk_idx,
+            args.cumulative_local_expert_recv_stats,
+            args.psum_num_recv_tokens_per_scaleup_rank,
+            args.psum_num_recv_tokens_per_expert,
+            args.dst_buffer_slot_idx,
+            args.num_tokens,
+            args.sf_token_stride, args.sf_hidden_stride,
+            args.nccl_dev_comm, args.nccl_window,
+            args.buffer,
+            args.workspace, args.mapped_host_workspace,
+            args.rank_idx,
+            args.compact_buffer,
+            args.compact_window));
+    }
+};
+
+// Convenience launcher used by buffer.hpp dispatch() when fast path is enabled.
+static void launch_dispatch_fast_path(void* x, void* sf,
+                                      topk_idx_t* topk_idx, float* topk_weights,
+                                      topk_idx_t* copied_topk_idx,
+                                      int* cumulative_local_expert_recv_stats,
+                                      int* psum_num_recv_tokens_per_scaleup_rank,
+                                      int* psum_num_recv_tokens_per_expert,
+                                      int* dst_buffer_slot_idx,
+                                      const int& num_tokens, const int& num_max_tokens_per_rank,
+                                      const int& hidden, const int& elem_size,
+                                      const int& num_sf_packs,
+                                      const int& sf_token_stride, const int& sf_hidden_stride,
+                                      const int& num_experts, const int& num_topk,
+                                      const int& expert_alignment,
+                                      const ncclDevComm_t& nccl_dev_comm,
+                                      const ncclWindow_t& nccl_window,
+                                      void* buffer,
+                                      void* workspace, void* mapped_host_workspace,
+                                      const int& rank_idx,
+                                      const int& num_ranks,
+                                      const bool& is_scaleup_nvlink,
+                                      const int& num_sms,
+                                      const int& num_smem_bytes,
+                                      const int& num_qps, const int64_t& num_timeout_cycles,
+                                      const bool& do_cpu_sync,
+                                      void* compact_buffer,
+                                      const ncclWindow_t& compact_window,
+                                      const at::cuda::CUDAStream& stream) {
+    const int num_notify_warps = kNumNotifyWarps;
+    EP_HOST_ASSERT(num_notify_warps % 4 == 0);
+
+    // Same warp budget heuristic as legacy: take max warps that fit in smem
+    // and don't exceed 32 / SM, capped to ceil_div(512, num_sms).
+    const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
+    const int num_notify_smem_bytes = get_num_notify_smem_bytes(num_ranks, num_experts);
+    const int num_dispatch_warps = std::min<int>(std::min<int>(
+        (num_smem_bytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(),
+        32 - num_notify_warps),
+        math::ceil_div(512, num_sms));
+    const int num_threads = (num_notify_warps + num_dispatch_warps) * 32;
+
+    const DispatchFastPathRuntime::Args args = {
+        .is_scaleup_nvlink = is_scaleup_nvlink,
+        .do_cpu_sync       = do_cpu_sync,
+        .num_notify_warps  = num_notify_warps,
+        .num_dispatch_warps = num_dispatch_warps,
+        .num_ranks         = num_ranks,
+        .num_hidden_bytes  = hidden * elem_size,
+        .num_sf_packs      = num_sf_packs,
+        .num_max_tokens_per_rank = num_max_tokens_per_rank,
+        .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment,
+        .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .x = x, .sf = static_cast<sf_pack_t*>(sf), .topk_idx = topk_idx, .topk_weights = topk_weights,
+        .copied_topk_idx = copied_topk_idx,
+        .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats,
+        .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
+        .psum_num_recv_tokens_per_expert       = psum_num_recv_tokens_per_expert,
+        .dst_buffer_slot_idx = dst_buffer_slot_idx,
+        .num_tokens = num_tokens,
+        .sf_token_stride = sf_token_stride, .sf_hidden_stride = sf_hidden_stride,
+        .nccl_dev_comm = nccl_dev_comm, .nccl_window = nccl_window,
+        .buffer = buffer,
+        .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
+        .rank_idx = rank_idx,
+        .compact_buffer = compact_buffer,
+        .compact_window = compact_window,
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes,
+                                       2 - (num_sms % 2), true)};
+    const auto code = DispatchFastPathRuntime::generate(args);
+    const auto runtime = jit::compiler->build("dispatch_fast_path", code);
+    DispatchFastPathRuntime::launch(runtime, args, stream);
+}
+
 class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopyEpilogueRuntime> {
 public:
     struct Args {
