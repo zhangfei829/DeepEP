@@ -443,12 +443,25 @@ dispatch_impl_fast_path(
                 EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
 
                 // ----- 1. hidden (Region A) -----
+                // NOTE: cp.async.bulk.global.shared::cta (used by tma_store_1d)
+                // requires the source in shared memory.  In fast path we don't
+                // stage hidden through smem (saves a load / barrier / smem),
+                // so we use vectorized LDG.128 + STG.128 from global x to the
+                // peer-mapped LSA pointer instead.  Each master lane copies
+                // its own (token, dst_rank) pair serially; this is good enough
+                // for correctness while we keep the no-stage layout.
                 {
                     auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
                     auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, dst_rank);
                     if (sym_dst != nullptr) {
-                        const auto src_ptr = math::advance_ptr(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes);
-                        ptx::tma_store_1d(sym_dst, src_ptr, kNumHiddenBytes);
+                        const auto* src_v = reinterpret_cast<const uint4*>(
+                            math::advance_ptr(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes));
+                        auto* dst_v = reinterpret_cast<uint4*>(sym_dst);
+                        EP_STATIC_ASSERT(kNumHiddenBytes % 16 == 0, "hidden must be 16B-aligned");
+                        constexpr int kNumU4 = kNumHiddenBytes / 16;
+                        #pragma unroll
+                        for (int k = 0; k < kNumU4; ++ k)
+                            dst_v[k] = __ldg(src_v + k);
                     }
                 }
 
@@ -507,8 +520,7 @@ dispatch_impl_fast_path(
                         }
                     }
                 }
-
-                ptx::tma_store_commit();
+                // No TMA in-flight in fast path; commit_group is a no-op here.
             }
             __syncwarp();
 
