@@ -37,6 +37,9 @@ err()  { printf '\033[1;31m[sweep:ERR]\033[0m %s\n' "$*" >&2; }
 # DeepEP hot path is in CUDA kernels.
 : "${DEEPEP_DISABLE_TORCH_COMPILE:=1}"
 export DEEPEP_DISABLE_TORCH_COMPILE
+# Fast-path dispatch (non-expand + intra-NVL72). 0 = legacy, 1 = compact RECV BUFFER.
+: "${DEEPEP_FAST_PATH:=0}"
+export DEEPEP_FAST_PATH
 
 : "${TRAYS:=pod4-gb300-2-tray01-f3 pod4-gb300-2-tray02-f3 pod4-gb300-2-tray03-f3 pod4-gb300-2-tray04-f3}"
 : "${DEEPEP_DIR:=/home/fizhang/DeepEP}"
@@ -248,15 +251,19 @@ run_one() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$ep" "$tokens" "$topk" "$experts" "$FP8" >> "$INDEX_FILE"
 
   # build argv for test_ep.py (consumed via runpy in mpi_launch_ep.py)
+  # VALIDATE=1 disables --skip-check so the test runs the full Python reference
+  # comparison (slow but verifies bit-equal output of fast path vs reference).
   local args=(
     --num-tokens "$tokens"
     --hidden 7168
     --num-topk "$topk"
     --num-experts "$experts"
-    --skip-check
     --test-first-only
     --num-processes "$SLOTS_PER_NODE"
   )
+  if [ "${VALIDATE:-0}" != "1" ]; then
+    args+=(--skip-check)
+  fi
   # default 1 toggle is built into test_ep.py; pass through optional knobs
   # (we deliberately don't override allow_hybrid_mode / multiple_reduction here -
   #  the test_ep.py defaults to both = 1 which matches V3-style production setup)
@@ -273,6 +280,7 @@ run_one() {
     -x PATH -x LD_LIBRARY_PATH -x CUDA_HOME -x MPI_HOME \
     -x PYTHONPATH -x EP_NCCL_ROOT_DIR \
     -x DEEPEP_DISABLE_TORCH_COMPILE \
+    -x DEEPEP_FAST_PATH \
     -x NCCL_DEBUG -x EP_BUFFER_DEBUG \
     -x MASTER_ADDR="$MASTER_ADDR" -x MASTER_PORT="$MASTER_PORT" \
     -x DEEPEP_LOG_DIR="$DEEPEP_LOG_DIR" -x DEEPEP_RUN_TAG="$tag" \

@@ -223,10 +223,10 @@ SWEEP_TAG="deepep_sweep_$RUN_ID"
 # ssh joins argv with spaces *without re-quoting*. Build one shell-safe
 # string with printf %q (escapes spaces in TRAYS / EP_SIZES / etc.) and
 # pass it as a single argv to ssh.
-REMOTE_SWEEP_CMD=$(printf "DEEPEP_DIR=%q NCCL_ROOT_DIR=%q DEEPEP_LOG_DIR=%q TRAYS=%q SWEEP_TAG=%q PYTHON_BIN=%q EP_SIZES=%q TOKENS=%q TOPK_EXPERTS=%q FP8=%q EXTRA_ARGS=%q bash -l %q" \
+REMOTE_SWEEP_CMD=$(printf "DEEPEP_DIR=%q NCCL_ROOT_DIR=%q DEEPEP_LOG_DIR=%q TRAYS=%q SWEEP_TAG=%q PYTHON_BIN=%q EP_SIZES=%q TOKENS=%q TOPK_EXPERTS=%q FP8=%q EXTRA_ARGS=%q DEEPEP_FAST_PATH=%q VALIDATE=%q bash -l %q" \
     "$DEEPEP_DIR" "$NCCL_ROOT_DIR" "$DEEPEP_LOG_DIR" "$TRAYS" "$SWEEP_TAG" \
     "${PYTHON_BIN:-}" "${EP_SIZES:-4 8 16}" "${TOKENS:-1024 2048 4096 8192}" \
-    "${TOPK_EXPERTS:-8:256}" "${FP8:-1}" "${EXTRA_ARGS:-}" \
+    "${TOPK_EXPERTS:-8:256}" "${FP8:-1}" "${EXTRA_ARGS:-}" "${DEEPEP_FAST_PATH:-0}" "${VALIDATE:-0}" \
     "$DEEPEP_DIR/scripts/tray_deepep_sweep.sh")
 "${JSSH[@]}" "fizhang@$HEAD_TRAY" "$REMOTE_SWEEP_CMD" 2>&1 | sed 's/^/    /'
 
