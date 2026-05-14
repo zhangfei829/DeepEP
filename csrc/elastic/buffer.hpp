@@ -220,10 +220,14 @@ public:
         // lands at an address that is not P2P-accessible on this GPU and
         // triggers CUDA_ERROR_ILLEGAL_ADDRESS later (during next CUDA call).
         // (The legacy `nccl_window` does this in NCCLSymmetricMemoryContext.)
+        printf("[deepep-dbg] rank=%d ensure_compact_recv_window: num_nvl_ranks=%d, num_ranks=%d, num_scaleup_ranks=%d\n",
+               nccl_context->rank_idx, nccl_context->num_nvl_ranks,
+               nccl_context->num_ranks, nccl_context->num_scaleup_ranks);
         for (int i = 0; i < nccl_context->num_nvl_ranks; ++ i) {
             void* tmp_peer_ptr;
             NCCL_CHECK(ncclGetLsaDevicePointer(compact_window, 0, i, &tmp_peer_ptr));
-            (void)tmp_peer_ptr;
+            if (nccl_context->rank_idx == 0)
+                printf("[deepep-dbg] rank=0 LSA peer %d -> %p\n", i, tmp_peer_ptr);
         }
 
         // Cache config.
