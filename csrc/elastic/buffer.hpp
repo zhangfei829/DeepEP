@@ -1353,9 +1353,11 @@ public:
             allocate_on_comm_stream, async_with_compute_stream);
 
         if (fast_path and nccl_context->rank_idx == 0) {
-            const auto e = cudaDeviceSynchronize();
-            printf("[fp:dbg] after stream_control_epilogue sync: %s\n",
-                   e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+            const auto e1 = cudaDeviceSynchronize();
+            const auto e2 = cudaGetLastError();
+            printf("[fp:dbg] after stream_control_epilogue sync: %s; last_err=%s\n",
+                   e1 == cudaSuccess ? "OK" : cudaGetErrorString(e1),
+                   e2 == cudaSuccess ? "OK" : cudaGetErrorString(e2));
         }
 
         return {recv_x, recv_sf,
