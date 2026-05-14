@@ -333,6 +333,14 @@ dispatch_impl_fast_path(
                 int* self_slot = compact_layout.peer_psum_ptr(/*dst=*/0, /*src=*/0);
                 const int v = ptx::ld_volatile<int>(self_slot);
                 printf("[fp] rank0 self-broadcast check: G[0][0] = %d (expected 1)\n", v);
+                // Sleep then read G[d=*][s=0] (writes peers should have made):
+                for (int spin = 0; spin < 1000000; ++spin) {
+                    if (clock64() & 0xffffffff) { /* burn cycles */ }
+                }
+                for (int d = 0; d < kNumRanks; ++d) {
+                    int v2 = ptx::ld_volatile<int>(compact_layout.peer_psum_ptr(d, 0));
+                    printf("[fp] rank0 G[d=%d][s=0]=%d\n", d, v2);
+                }
             }
             __syncwarp();
         }
