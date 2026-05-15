@@ -396,10 +396,27 @@ dispatch_impl_fast_path(
             ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
         __syncwarp();
 
-        const auto token_start  = dispatch_warp_idx * kNumSMs + sm_idx;
-        const auto token_stride = kNumWarps * kNumSMs;
+        // Dynamic chunked token assignment: each warp atomicAdd-claims a chunk
+        // of `kTokenChunk` tokens from a global counter. Fast SMs (e.g. SM 6/7
+        // in jitter measurements) automatically pick up extra work, smoothing
+        // per-SM dispatch_end and shrinking the cross-rank barrier wait.
+        // Counter is reused notify_reduction_workspace[0] (already reset to 0
+        // at the end of phase 1).
+        constexpr int kTokenChunk = 4;
+        int64_t* dyn_token_counter = workspace_layout.get_notify_reduction_workspace_ptr();
 
-        for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
+        while (true) {
+            int chunk_start;
+            if (lane_idx == 0) {
+                chunk_start = static_cast<int>(atomicAdd(
+                    reinterpret_cast<unsigned long long*>(dyn_token_counter),
+                    static_cast<unsigned long long>(kTokenChunk)));
+            }
+            chunk_start = __shfl_sync(0xffffffff, chunk_start, 0);
+            if (chunk_start >= num_tokens) break;
+            const int chunk_end = chunk_start + kTokenChunk < num_tokens
+                                ? chunk_start + kTokenChunk : num_tokens;
+            for (int token_idx = chunk_start; token_idx < chunk_end; ++ token_idx) {
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
 
             // Wait any previous TMA stores to drain
@@ -585,14 +602,20 @@ dispatch_impl_fast_path(
             // No per-master arrival_counter atomic: cross-rank `kDispatchTag1`
             // barrier at the end of this kernel already guarantees all src
             // dispatch stores are globally visible to every dst once the
-            // barrier releases. Using the cross-rank barrier replaces 16384
-            // per-master NVLink atomics with one cross-rank handshake (~14us).
+            // barrier releases.
             __syncwarp();
-        }
+            }  // end of inner-for over chunk_start..chunk_end
+        }  // end of while(true) chunked-claim loop
 
         // Drain remaining TMA stores before final barrier
         ptx::tma_store_wait();
         __syncwarp();
+    }
+    __syncthreads();
+    // Reset dyn_token_counter (= notify_reduction_workspace[0]) for next dispatch
+    // before cross-rank barrier so all ranks see clean 0 next time.
+    if (sm_idx == 0 and thread_idx == 0) {
+        *workspace_layout.get_notify_reduction_workspace_ptr() = 0;
     }
     __syncthreads();
     t_after_dispatch = clock64();
