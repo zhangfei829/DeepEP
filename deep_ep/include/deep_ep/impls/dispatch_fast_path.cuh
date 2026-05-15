@@ -508,7 +508,13 @@ dispatch_impl_fast_path(
             (void)my_stage_C; (void)my_stage_D;
             __syncwarp();
 
-            // ABLATION C: skip red_add to dst arrival_counter.
+            // Arrival counter on dst (one lane per unique dst)
+            if (is_master_for_dst) {
+                int* sym_counter = gin_compact.template get_sym_ptr<team_t>(
+                    compact_layout.arrival_counter_ptr(rank_idx), my_dst_rank);
+                if (sym_counter != nullptr)
+                    ptx::red_add_rel_sys(sym_counter, 1);
+            }
             __syncwarp();
         }
 
@@ -520,10 +526,16 @@ dispatch_impl_fast_path(
     t_after_dispatch = clock64();
 
     // -----------------------------------------------------------------------
-    // PHASE 3: ABLATION C — skip arrival_counter wait so we can measure
-    // dispatch loop alone without red_add cost (red_add removed above).
+    // PHASE 3: dst-side wait until arrival counters >= rank_count
     // -----------------------------------------------------------------------
-    if (false and sm_idx == 0 and warp_idx == 0) {
+    // After Phase 2 every src has finished writing; each dst now needs to wait
+    // until its Region F arrival counters cumulatively account for all tokens
+    // each src promised in the NOTIFY phase.
+    if (sm_idx == 0 and warp_idx == 0) {
+        // rank_count[i] was placed into the lower 32-bits of
+        // workspace_layout.get_scaleup_rank_count_ptr<false>()[i] during NOTIFY.
+        // We read it back and wait until our compact arrival counter has reached
+        // that value for every src.
         for (int src = thread_idx; src < kNumRanks; src += 32) {
             const auto expected = static_cast<int>(ptx::ld_volatile<int64_t>(
                 workspace_layout.get_scaleup_rank_count_ptr<false>() + src));
