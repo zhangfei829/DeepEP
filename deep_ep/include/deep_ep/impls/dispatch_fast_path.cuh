@@ -71,8 +71,7 @@ dispatch_impl_fast_path(
     const int rank_idx,
     // ----- fast-path additions -----
     void* compact_buffer,            // local LSA pointer to compact_recv_window base
-    const ncclWindow_t compact_window,
-    unsigned long long* dyn_token_counter   // device-only (cudaMalloc) L2 atomic counter
+    const ncclWindow_t compact_window
 ) {
     // -----------------------------------------------------------------------
     // Compile-time constants
@@ -397,25 +396,10 @@ dispatch_impl_fast_path(
             ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
         __syncwarp();
 
-        // Dynamic chunked token assignment via device-only L2 atomic counter
-        // (`dyn_token_counter` is cudaMalloc, NOT NCCL window — atomicAdd lands
-        // in L2 cache instead of serialising over NVLink fabric). Fast SMs
-        // automatically pick up extra work, smoothing per-SM dispatch_end and
-        // shrinking cross-rank barrier wait by ~10-20us.
-        constexpr int kTokenChunk = 4;
+        const auto token_start  = dispatch_warp_idx * kNumSMs + sm_idx;
+        const auto token_stride = kNumWarps * kNumSMs;
 
-        while (true) {
-            int chunk_start;
-            if (lane_idx == 0) {
-                chunk_start = static_cast<int>(atomicAdd(
-                    dyn_token_counter,
-                    static_cast<unsigned long long>(kTokenChunk)));
-            }
-            chunk_start = __shfl_sync(0xffffffff, chunk_start, 0);
-            if (chunk_start >= num_tokens) break;
-            const int chunk_end = chunk_start + kTokenChunk < num_tokens
-                                ? chunk_start + kTokenChunk : num_tokens;
-            for (int token_idx = chunk_start; token_idx < chunk_end; ++ token_idx) {
+        for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
 
             // Wait any previous TMA stores to drain
@@ -601,10 +585,10 @@ dispatch_impl_fast_path(
             // No per-master arrival_counter atomic: cross-rank `kDispatchTag1`
             // barrier at the end of this kernel already guarantees all src
             // dispatch stores are globally visible to every dst once the
-            // barrier releases.
+            // barrier releases. Using the cross-rank barrier replaces 16384
+            // per-master NVLink atomics with one cross-rank handshake (~14us).
             __syncwarp();
-            }  // end of inner for token_idx in [chunk_start, chunk_end)
-        }  // end of while(true) chunk-claim loop
+        }
 
         // Drain remaining TMA stores before final barrier
         ptx::tma_store_wait();
