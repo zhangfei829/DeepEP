@@ -474,54 +474,69 @@ dispatch_impl_fast_path(
                                           tma_buffer.get_sf_ptr(), kSFBytesPerToken);
                 }
 
-                // 3. Region C: topk_idx — master writes the full kNumTopk row
+                // 3. Region C: topk_idx — master writes kNumTopk int64 row.
+                // Vectorize as 4x16B int4 stores (kNumTopk=8 -> 4 int4 = 64B) to
+                // reduce NVLink scalar-store pressure vs 8x8B writes.
+                EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
+                                 "Region C int4 packing assumes kNumTopk=8 int64");
                 {
                     auto* dst_topk_local = static_cast<topk_idx_t*>(
                         compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
                     topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(
                         dst_topk_local, my_dst_rank);
                     if (sym_dst != nullptr) {
+                        topk_idx_t local_topk[kNumTopk];
                         #pragma unroll
                         for (int k = 0; k < kNumTopk; ++ k) {
                             const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
                             const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
-                            sym_dst[k] = in_dst
+                            local_topk[k] = in_dst
                                 ? static_cast<topk_idx_t>(raw - my_dst_rank * kNumExpertsPerRank)
                                 : static_cast<topk_idx_t>(-1);
                         }
+                        auto* dst_v = reinterpret_cast<int4*>(sym_dst);
+                        const auto* src_v = reinterpret_cast<const int4*>(local_topk);
+                        #pragma unroll
+                        for (int v = 0; v < kNumTopk * static_cast<int>(sizeof(topk_idx_t)) / 16; ++ v)
+                            dst_v[v] = src_v[v];
                     }
                 }
 
-                // 4. Region D: topk_weights — master writes the full kNumTopk row
+                // 4. Region D: topk_weights — master writes kNumTopk float row.
+                // Vectorize as 2x16B int4 stores (8 floats = 32B = 2 int4).
                 if (topk_weights != nullptr) {
                     float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
                         compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
                         my_dst_rank);
                     if (sym_dst != nullptr) {
+                        float local_w[kNumTopk];
                         #pragma unroll
                         for (int k = 0; k < kNumTopk; ++ k)
-                            sym_dst[k] = __ldg(topk_weights + token_idx * kNumTopk + k);
+                            local_w[k] = __ldg(topk_weights + token_idx * kNumTopk + k);
+                        auto* dst_v = reinterpret_cast<int4*>(sym_dst);
+                        const auto* src_v = reinterpret_cast<const int4*>(local_w);
+                        #pragma unroll
+                        for (int v = 0; v < kNumTopk * static_cast<int>(sizeof(float)) / 16; ++ v)
+                            dst_v[v] = src_v[v];
                     }
                 }
 
-                // 5. Region E: src_metadata — master writes the full (2 + kNumTopk) row
+                // 5. Region E: src_metadata — master writes only [0]=src_token_global
+                // and [1]=master_src_topk_idx. The remaining (2 + kNumTopk) entries
+                // are only needed for do_expand path which fast-path doesn't support.
+                // Combine + user code only read [0] and [1].
                 {
                     int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
                         compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
                         my_dst_rank);
                     if (sym_dst != nullptr) {
-                        sym_dst[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
-                        // master_src_topk_idx is this master's own lane_idx (highest lane
-                        // in its dst's match group, which by definition is itself).
-                        // Combine reads this as src_topk_idx to recover (src_rank, k) for
-                        // pushing back the contribution.
-                        sym_dst[1] = rank_idx * kNumTopk + lane_idx;
-                        #pragma unroll
-                        for (int k = 0; k < kNumTopk; ++ k) {
-                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
-                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
-                            sym_dst[2 + k] = in_dst ? (raw - my_dst_rank * kNumExpertsPerRank) : -1;
-                        }
+                        // Pack [0,1] as one int2 (8B) write.
+                        int2 v;
+                        v.x = rank_idx * kNumMaxTokensPerRank + token_idx;
+                        // master_src_topk_idx is this master's own lane_idx (highest
+                        // lane in its dst's match group, which by definition is itself).
+                        v.y = rank_idx * kNumTopk + lane_idx;
+                        *reinterpret_cast<int2*>(sym_dst) = v;
                     }
                 }
 
