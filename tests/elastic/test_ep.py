@@ -546,6 +546,16 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     _cd_src = cached_handle.recv_src_metadata[:10, 0].tolist()
                     _p(f'  [fp:src] handle.recv_src_metadata[:10, 0]={_fp_src}')
                     _p(f'  [fp:src] cached.recv_src_metadata[:10, 0]={_cd_src}')
+                    _max = num_max_tokens_per_rank
+                    _T0 = _fp_src[0] % _max
+                    _R0 = _fp_src[0] // _max
+                    _p(f'  [fp:row0] T={_T0} src_rank={_R0}')
+                    if _R0 == buffer.rank_idx:
+                        _p(f'  [fp:row0] topk_idx[{_T0}]={topk_idx[_T0].tolist()}')
+                        _p(f'  [fp:row0] cloned [{_T0}]={handle.topk_idx[_T0].tolist()}')
+                        _p(f'  [fp:row0] dst_buf_slot[{_T0}]={handle.dst_buffer_slot_idx[_T0].tolist()}')
+                        _p(f'  [fp:row0] fp.recv_topk_idx[0]={recv_topk_idx[0].tolist()}')
+                        _p(f'  [fp:row0] cd.recv_topk_idx[0]={cached_recv_topk_idx[0].tolist()}')
                 except Exception as _e:
                     _p(f'  [fp:src] ERROR: {_e}')
 
