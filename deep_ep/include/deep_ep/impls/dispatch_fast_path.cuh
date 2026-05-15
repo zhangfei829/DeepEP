@@ -75,9 +75,16 @@ dispatch_impl_fast_path(
 ) {
     // -----------------------------------------------------------------------
     // Compile-time constants
+    //
+    // NOTE: fast-path uses **phase-based partitioning** rather than legacy's
+    // warp-role partitioning: ALL kNumThreads participate in both phase 1
+    // (NOTIFY) and phase 2 (DISPATCH).  kNumNotifyWarps / kNumDispatchWarps
+    // are kept as template parameters only to compute kNumWarps =
+    // kNumNotifyWarps + kNumDispatchWarps and the legacy-shaped tma_buffer
+    // smem layout; they don't gate which warps run which phase.
     // -----------------------------------------------------------------------
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
-    constexpr int kNumNotifyThreads  = kNumNotifyWarps * 32;
+    constexpr int kNumWarps          = kNumNotifyWarps + kNumDispatchWarps;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
 
@@ -96,10 +103,11 @@ dispatch_impl_fast_path(
     const auto host_workspace_layout = layout::WorkspaceLayout(mapped_host_workspace, 1, kNumRanks, kNumExperts);
 
     // Dynamic shared memory: NOTIFY counters region (first kNumSmemBytesForNotify)
-    // followed by kNumDispatchWarps per-warp tma_buffer slots (same layout as
-    // legacy dispatch_impl). Host launches with num_smem_bytes >= notify + warps*tma_buffer_bytes.
-    constexpr int kNumSmemBytesForNotify = kNumNotifyThreads > 0 ?
-        math::constexpr_align(kNumRanks + kNumExperts, kNumNotifyThreads) * sizeof(int) : 0;
+    // followed by kNumWarps per-warp tma_buffer slots (same layout as legacy
+    // dispatch_impl, but one slot per warp now that ALL warps run DISPATCH).
+    // Host launches with num_smem_bytes >= notify + kNumWarps*tma_buffer_bytes.
+    constexpr int kNumSmemBytesForNotify =
+        math::constexpr_align(kNumRanks + kNumExperts, kNumThreads) * sizeof(int);
     EP_STATIC_ASSERT(kNumSmemBytesForNotify % ptx::kNumTMAAlignBytes == 0, "Invalid TMA alignment");
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
 
@@ -133,25 +141,24 @@ dispatch_impl_fast_path(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
     // -----------------------------------------------------------------------
-    // PHASE 1: NOTIFY (only the first kNumNotifyWarps warps participate).
+    // PHASE 1: NOTIFY — ALL kNumWarps warps participate (kNumThreads total).
     // Identical to legacy NOTIFY, plus the dst->src G broadcast at the end.
     // -----------------------------------------------------------------------
-    if (warp_idx < kNumNotifyWarps) {
-        constexpr int kNotifyBarrierIndex = 1;
-        constexpr int kNumAlignedElems    = kNumSmemBytesForNotify / sizeof(int);
+    {
+        constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
         const auto rank_expert_count = math::advance_ptr<int>(smem, 0);
 
         int *rank_count   = rank_expert_count;
         int *expert_count = rank_expert_count + kNumRanks;
         #pragma unroll
-        for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++ i)
-            rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
-        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        for (int i = 0; i < kNumAlignedElems / kNumThreads; ++ i)
+            rank_expert_count[i * kNumThreads + thread_idx] = 0;
+        __syncthreads();
 
-        // Atomic add on shared memory
+        // Atomic add on shared memory (all kNumWarps warps participate)
         EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes");
         const auto global_warp_idx_n = warp_idx * kNumSMs + sm_idx;
-        for (int i = global_warp_idx_n; i < num_tokens; i += kNumNotifyWarps * kNumSMs) {
+        for (int i = global_warp_idx_n; i < num_tokens; i += kNumWarps * kNumSMs) {
             const auto dst_expert_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(topk_idx + i * kNumTopk + lane_idx)) : -1;
             if (dst_expert_idx >= 0)
@@ -161,11 +168,11 @@ dispatch_impl_fast_path(
             if (ptx::deduplicate(dst_rank_idx_n, lane_idx) and dst_rank_idx_n >= 0)
                 atomicAdd_block(rank_count + dst_rank_idx_n, 1);
         }
-        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        __syncthreads();
 
         // Cross-SM reduction (encoded counters)
         #pragma unroll
-        for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
+        for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumThreads) {
             const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
             ptx::red_add(workspace_layout.get_notify_reduction_workspace_ptr() + i, counter);
         }
@@ -173,7 +180,7 @@ dispatch_impl_fast_path(
         if (sm_idx == 0) {
             // Reduce all SM's count and prepare send buffer
             #pragma unroll
-            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
+            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumThreads) {
                 comm::timeout_while<kNumTimeoutCycles>(true, [=](const bool& is_last_check) {
                     const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                     if ((status >> 32) == kNumSMs) {
@@ -193,10 +200,10 @@ dispatch_impl_fast_path(
                     return false;
                 });
             }
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            __syncthreads();
 
             // Cross-rank exchange: rank counts
-            for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+            for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
                 const auto dst_rank_counter =
                     workspace_layout.get_scaleup_rank_count_ptr<false>() + rank_idx;
                 gin.put_value<team_t>(dst_rank_counter, static_cast<int64_t>(rank_count[i]), i,
@@ -206,7 +213,7 @@ dispatch_impl_fast_path(
 
             // Cross-rank exchange: expert counts (intra-NVL72 path: per-element NVLink store)
             if constexpr (kIsScaleupNVLink) {
-                for (int i = thread_idx; i < kNumExperts; i += kNumNotifyThreads) {
+                for (int i = thread_idx; i < kNumExperts; i += kNumThreads) {
                     const auto idx = kNumExpertsPerRank * rank_idx + (i % kNumExpertsPerRank);
                     gin.put_value<team_t>(
                         workspace_layout.get_scaleup_expert_count_ptr<false>() + idx,
@@ -215,17 +222,17 @@ dispatch_impl_fast_path(
             } else {
                 // Bulk copy via gin.put for RDMA path; fast-path is intra-NVL72 only,
                 // so this branch is dead but kept for parity.
-                for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+                for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
                     const auto src_ptr = workspace_layout.get_scaleup_expert_count_ptr<true>() + kNumExpertsPerRank * i;
                     const auto dst_ptr = workspace_layout.get_scaleup_expert_count_ptr<false>() + kNumExpertsPerRank * rank_idx;
                     gin.put<team_t>(dst_ptr, src_ptr, kNumExpertsPerRank * sizeof(int64_t), i);
                 }
             }
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            __syncthreads();
 
             // Wait for rank and expert counts from peers
             const auto start_clock = clock64();
-            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
+            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumThreads) {
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                     const auto count = static_cast<int>(
                         ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + i));
@@ -241,10 +248,10 @@ dispatch_impl_fast_path(
                     return false;
                 }, start_clock);
             }
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            __syncthreads();
 
             // Aggregate per-expert sums and update stats counter
-            for (int i = thread_idx; i < kNumExpertsPerRank; i += kNumNotifyThreads) {
+            for (int i = thread_idx; i < kNumExpertsPerRank; i += kNumThreads) {
                 int sum = 0;
                 #pragma unroll
                 for (int j = 0; j < kNumRanks; ++ j)
@@ -253,11 +260,11 @@ dispatch_impl_fast_path(
                 if (cumulative_local_expert_recv_stats != nullptr)
                     atomicAdd(cumulative_local_expert_recv_stats + i, sum);
             }
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            __syncthreads();
 
             // Write host workspace if CPU sync is requested (lets host read N_recv)
             if constexpr (kDoCPUSync) {
-                for (int i = thread_idx; i < kNumRanks + kNumExpertsPerRank; i += kNumNotifyThreads) {
+                for (int i = thread_idx; i < kNumRanks + kNumExpertsPerRank; i += kNumThreads) {
                     host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[i] =
                         math::encode_decode_positive(rank_expert_count[i]);
                 }
@@ -283,25 +290,11 @@ dispatch_impl_fast_path(
             } else if (warp_idx == 1) {
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            __syncthreads();
 
             // ===== FAST-PATH-ONLY: dst -> src broadcast of psum_per_scaleup_rank =====
-            // After psum is ready on this rank, push our entire `psum_per_scaleup_rank`
-            // array to every peer's compact_window Region G row indexed by [rank_idx].
-            // peer Region G layout: peer_psum_buf[dst_rank=peer][src_rank=who_wrote_it].
-            // We write OUR psum (which is "this rank's view of how many tokens from each
-            // src rank are arriving") into peer's row indexed by rank_idx.
-            // After this, every peer has, for its own dst Region G row [rank_idx], the
-            // psum that WE computed - i.e. peer-as-src learns "my (peer's) compact base
-            // offset on dst=rank_idx".
-            //
-            // Equivalent recv-side: peer_psum_row_ptr(dst_rank=rank_idx) of this rank's
-            // local Region G is written by each remote peer, providing this rank with
-            // its compact base offset on each dst.
-            //
-            // Encoding: store (psum_val + 1) so 0 means "not arrived yet";
-            // the src side spin-waits for non-zero then subtracts 1.
-            for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+            // (See comment block in earlier revision for the full protocol description.)
+            for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
                 int* dst_psum_slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/rank_idx,
                                                                   /*src_rank_idx=*/i);
                 const int psum_val_exclusive = (i == 0) ? 0
@@ -347,39 +340,39 @@ dispatch_impl_fast_path(
     __syncthreads();
 
     // -----------------------------------------------------------------------
-    // PHASE 2: dispatch warps do staged TMA stores (same pipeline as legacy
-    // dispatch_impl, but dst is compact_buffer regions A/B/C/D/E indexed by
-    // compact_idx, not legacy per-rank packed slot).
+    // PHASE 2: ALL kNumWarps warps run the staged TMA dispatch pipeline.
+    // Compared to legacy (which only uses kNumDispatchWarps warps for dispatch
+    // and lets kNumNotifyWarps idle), fast-path uses every warp so each warp's
+    // per-token loop is shorter (more parallelism, fewer iterations).
     //
     // Per-warp tma_buffer (in dynamic smem, after the NOTIFY region) stages
-    // hidden + sf + topk_idx + topk_weights + metadata. Then for each unique
-    // dst_rank in the token's topk:
-    //   - TMA store smem hidden -> peer compact A[compact_idx]
-    //   - TMA store smem sf -> peer compact B[compact_idx]
-    //   - master lane writes full topk_idx / topk_weights / src_metadata rows
-    //     directly to peer regions (small, no smem staging needed)
-    //   - master lane red_add_rel_sys to peer arrival_counter[my_rank]
+    // hidden + sf. Then for each unique dst_rank in the token's topk:
+    //   - master TMA-stores smem hidden -> peer compact A[compact_idx]
+    //   - master TMA-stores smem sf     -> peer compact B[compact_idx] (if any)
+    //   - lanes 0..7 cooperatively stage region C/D in per-warp smem; master
+    //     issues 1 TMA store per region to peer regions C/D
+    //   - master writes region E [0,1] as a single int2 (8B) scalar store
+    //   - master red_add_rel_sys to peer arrival_counter[my_rank]
     // -----------------------------------------------------------------------
-    if (warp_idx >= kNumNotifyWarps) {
-        const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
+    {
+        // Use warp_idx directly as the per-warp slot index.
+        const int dispatch_warp_idx = warp_idx;
 
         // Per-warp tma_buffer in dynamic smem after the notify region.
+        // Allocate kNumWarps slots (one per participating warp).
         const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kSFBytesPerToken, kNumTopk, true);
-        const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumDispatchWarps, 1,
+        const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumWarps, 1,
             math::advance_ptr<int8_t>(smem, kNumSmemBytesForNotify))
             .get_rank_buffer(dispatch_warp_idx).get_token_buffer(0);
 
-        // Per-warp metadata staging area (Region C + Region D src-side smem, used
-        // as TMA store source so we get one TMA store per region instead of
-        // 4+2 individual int4 NVLink writes per master per token).
-        // Layout: 64B Region C (8 int64) + 32B Region D (8 float) = 96B per warp,
-        // padded to TMA align (32B). Placed AFTER all warps' tma_buffer slots.
+        // Per-warp metadata staging area (Region C + Region D src-side smem),
+        // placed AFTER all warps' tma_buffer slots.
         constexpr int kStageBytesPerWarp =
             math::constexpr_align<int>(static_cast<int>(kNumTopk * sizeof(topk_idx_t)) +
                                        static_cast<int>(kNumTopk * sizeof(float)),
                                        ptx::kNumTMAAlignBytes);
         const int64_t kStageBaseOffset = static_cast<int64_t>(kNumSmemBytesForNotify) +
-            static_cast<int64_t>(kNumDispatchWarps) *
+            static_cast<int64_t>(kNumWarps) *
                 token_layout.template get_num_bytes<true, int64_t>();
         int8_t* warp_stage_base = math::advance_ptr<int8_t>(smem,
             kStageBaseOffset + static_cast<int64_t>(dispatch_warp_idx) * kStageBytesPerWarp);
@@ -395,7 +388,7 @@ dispatch_impl_fast_path(
         __syncwarp();
 
         const auto token_start  = dispatch_warp_idx * kNumSMs + sm_idx;
-        const auto token_stride = kNumDispatchWarps * kNumSMs;
+        const auto token_stride = kNumWarps * kNumSMs;
 
         for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
