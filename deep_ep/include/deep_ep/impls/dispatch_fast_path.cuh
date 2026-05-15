@@ -140,7 +140,7 @@ dispatch_impl_fast_path(
                       comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
-    // ---- DEBUG: per-phase cycle counters ----
+    // ---- DEBUG: per-phase cycle counters (sm0/thread0 prints at end) ----
     uint64_t t_kstart = clock64();
     uint64_t t_after_notify = 0, t_after_psum_wait = 0,
              t_after_dispatch = 0, t_after_arrival = 0, t_kend = 0;
@@ -598,8 +598,9 @@ dispatch_impl_fast_path(
     t_after_dispatch = clock64();
 
     // PHASE 3 (dst-side arrival_counter spin-wait) removed:
-    // The cross-rank `kDispatchTag1` barrier below already serializes "all
-    // ranks finished dispatch + made stores globally visible".
+    // the cross-rank `kDispatchTag1` barrier below already serializes "all
+    // ranks finished dispatch + made stores globally visible", which is
+    // strictly cheaper than 16384 per-master NVLink atomics.
     t_after_arrival = clock64();
 
     // Final cross-SM barrier to ensure all dst arrivals visible before kernel return.
