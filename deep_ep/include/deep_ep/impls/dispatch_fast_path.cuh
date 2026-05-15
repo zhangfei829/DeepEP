@@ -350,28 +350,23 @@ dispatch_impl_fast_path(
     t_after_psum_wait = clock64();
 
     // -----------------------------------------------------------------------
-    // PHASE 2: ALL kNumWarps warps run the staged TMA dispatch pipeline.
-    // Compared to legacy (which only uses kNumDispatchWarps warps for dispatch
-    // and lets kNumNotifyWarps idle), fast-path uses every warp so each warp's
-    // per-token loop is shorter (more parallelism, fewer iterations).
+    // PHASE 2: only kNumDispatchWarps warps run the staged TMA pipeline (same
+    // as legacy dispatch_impl). Notify warps idle in phase 2.
     //
-    // Per-warp tma_buffer (in dynamic smem, after the NOTIFY region) stages
-    // hidden + sf. Then for each unique dst_rank in the token's topk:
-    //   - master TMA-stores smem hidden -> peer compact A[compact_idx]
-    //   - master TMA-stores smem sf     -> peer compact B[compact_idx] (if any)
-    //   - lanes 0..7 cooperatively stage region C/D in per-warp smem; master
-    //     issues 1 TMA store per region to peer regions C/D
-    //   - master writes region E [0,1] as a single int2 (8B) scalar store
-    //   - master red_add_rel_sys to peer arrival_counter[my_rank]
+    // Originally fast-path had all kNumWarps warps run phase 2 to maximize
+    // parallelism, but the per-warp tma_buffer slot is ~14.4KB and at low
+    // num_sms (e.g. SM=16, num_dispatch_warps=15 -> 19 slots) we'd exceed the
+    // sm_103 ~228KB optin smem cap. Restricting to kNumDispatchWarps fixes the
+    // smem budget without measurable phase-2 throughput loss (NVLink fabric
+    // saturates regardless of how many src warps issue).
     // -----------------------------------------------------------------------
-    {
-        // Use warp_idx directly as the per-warp slot index.
-        const int dispatch_warp_idx = warp_idx;
+    if (warp_idx >= kNumNotifyWarps) {
+        const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
 
         // Per-warp tma_buffer in dynamic smem after the notify region.
-        // Allocate kNumWarps slots (one per participating warp).
+        // Allocate kNumDispatchWarps slots (one per dispatch warp).
         const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kSFBytesPerToken, kNumTopk, true);
-        const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumWarps, 1,
+        const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumDispatchWarps, 1,
             math::advance_ptr<int8_t>(smem, kNumSmemBytesForNotify))
             .get_rank_buffer(dispatch_warp_idx).get_token_buffer(0);
 
@@ -384,7 +379,7 @@ dispatch_impl_fast_path(
                                            static_cast<int>(kNumTopk * sizeof(float));
         constexpr int kStageBytesPerWarp = kNumTopk * kStagePerLaneBytes;  // 8 lanes * 96B = 768B
         const int64_t kStageBaseOffset = static_cast<int64_t>(kNumSmemBytesForNotify) +
-            static_cast<int64_t>(kNumWarps) *
+            static_cast<int64_t>(kNumDispatchWarps) *
                 token_layout.template get_num_bytes<true, int64_t>();
         int8_t* warp_stage_base = math::advance_ptr<int8_t>(smem,
             kStageBaseOffset + static_cast<int64_t>(dispatch_warp_idx) * kStageBytesPerWarp);
@@ -402,7 +397,7 @@ dispatch_impl_fast_path(
         __syncwarp();
 
         const auto token_start  = dispatch_warp_idx * kNumSMs + sm_idx;
-        const auto token_stride = kNumWarps * kNumSMs;
+        const auto token_stride = kNumDispatchWarps * kNumSMs;
 
         for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
