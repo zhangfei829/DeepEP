@@ -29,6 +29,10 @@ class ElasticBuffer {
     // NOTES: for all workspace, we must keep them as zeros
     void *workspace;
     void *host_workspace, *mapped_host_workspace;
+    // Device-only counter (cudaMalloc, NOT NCCL window) for fast-path dynamic
+    // chunked token assignment. atomicAdd lands in L2 cache; sized as
+    // unsigned long long so atomicAdd<unsigned long long> matches.
+    unsigned long long *fp_dyn_token_counter = nullptr;
     std::shared_ptr<layout::WorkspaceLayout> workspace_layout_wo_expert;
 
     // CUDA streams
@@ -137,6 +141,13 @@ public:
         CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(&mapped_host_workspace, host_workspace, 0));
         std::memset(host_workspace, 0, layout::WorkspaceLayout::get_num_bytes());
 
+        // Fast-path device-only token counter for dynamic chunked token
+        // assignment in dispatch_impl_fast_path. Must be plain cudaMalloc (NOT
+        // NCCL-window memory), so atomicAdd lands in L2 cache (~5ns) rather
+        // than serialising over NVLink fabric.
+        CUDA_RUNTIME_CHECK(cudaMalloc(&fp_dyn_token_counter, sizeof(unsigned long long)));
+        CUDA_RUNTIME_CHECK(cudaMemset(fp_dyn_token_counter, 0, sizeof(unsigned long long)));
+
         // We should call a barrier at the end
         // The barrier should be called by Python `dist.barrier`
         // NOTES: do not call our barrier, as the workspace is not ready yet
@@ -160,6 +171,10 @@ public:
 
         // Deallocate host workspaces
         CUDA_RUNTIME_CHECK(cudaFreeHost(host_workspace));
+        if (fp_dyn_token_counter != nullptr) {
+            CUDA_RUNTIME_CHECK(cudaFree(fp_dyn_token_counter));
+            fp_dyn_token_counter = nullptr;
+        }
 
         // Release fast-path compact window (collective: dereg + free)
         destroy_compact_recv_window();
@@ -1043,6 +1058,10 @@ public:
             ensure_compact_recv_window(num_max_tokens_per_rank, num_hidden_bytes,
                                        num_sf_packs * static_cast<int64_t>(sizeof(sf_pack_t)),
                                        num_topk);
+            // Reset device-only token counter to 0 before kernel launch. The
+            // kernel will atomicAdd into it; we reset on host side every call.
+            CUDA_RUNTIME_CHECK(cudaMemsetAsync(fp_dyn_token_counter, 0,
+                                               sizeof(unsigned long long), comm_stream));
             launch_dispatch_fast_path(x.data_ptr(), sf_ptr,
                                       topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
                                       copied_topk_idx_ptr,
@@ -1066,6 +1085,7 @@ public:
                                       do_cpu_sync,
                                       compact_mapped_ptr,
                                       compact_window,
+                                      fp_dyn_token_counter,
                                       comm_stream);
         } else {
             launch_dispatch(x.data_ptr(), sf_ptr,

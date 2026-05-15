@@ -346,6 +346,7 @@ public:
         // Fast-path additions
         void*       compact_buffer;
         ncclWindow_t compact_window;
+        unsigned long long* dyn_token_counter;  // device-only L2 atomic counter
 
         jit::LaunchArgs launch_args;
     };
@@ -391,7 +392,8 @@ static void __instantiate_kernel() {{
             args.workspace, args.mapped_host_workspace,
             args.rank_idx,
             args.compact_buffer,
-            args.compact_window));
+            args.compact_window,
+            args.dyn_token_counter));
     }
 };
 
@@ -422,6 +424,7 @@ static void launch_dispatch_fast_path(void* x, void* sf,
                                       const bool& do_cpu_sync,
                                       void* compact_buffer,
                                       const ncclWindow_t& compact_window,
+                                      unsigned long long* dyn_token_counter,
                                       const at::cuda::CUDAStream& stream) {
     const int num_notify_warps = kNumNotifyWarps;
     EP_HOST_ASSERT(num_notify_warps % 4 == 0);
@@ -467,6 +470,7 @@ static void launch_dispatch_fast_path(void* x, void* sf,
         .rank_idx = rank_idx,
         .compact_buffer = compact_buffer,
         .compact_window = compact_window,
+        .dyn_token_counter = dyn_token_counter,
         // Match legacy dispatch_impl launch attrs: cluster_dim = 2 - (num_sms % 2)
         // so cp.async.bulk.shared::cluster.global (TMA load) sees a proper
         // cluster context (legacy uses cluster_dim=2 on even num_sms).
