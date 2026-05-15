@@ -534,10 +534,20 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     _marker = recv_x.contiguous().view(torch.int32)[:, 0]
                     _expected = torch.arange(_marker.shape[0], device=_marker.device, dtype=torch.int32)
                     _ne = (_marker != _expected).nonzero().squeeze(-1)[:10].tolist()
-                    _p(f'  [fp:mark] first 10 mismatches (i where marker != i): {_ne}')
-                    _p(f'  [fp:mark] marker[0:10]={_marker[:10].tolist()}')
+                    _p(f'  [fp:mark] hidden first 10 mismatches: {_ne}; marker[0:10]={_marker[:10].tolist()}')
                 except Exception as _e:
-                    _p(f'  [fp:mark] ERROR: {_e}')
+                    _p(f'  [fp:mark] hidden ERROR: {_e}')
+
+                # Region C marker: recv_topk_idx[i][k] should equal i*100 + k
+                try:
+                    _N = recv_topk_idx.shape[0]
+                    _expected_c = (torch.arange(_N, device=recv_topk_idx.device, dtype=recv_topk_idx.dtype).unsqueeze(1) * 100
+                                   + torch.arange(8, device=recv_topk_idx.device, dtype=recv_topk_idx.dtype).unsqueeze(0))
+                    _ne_c = (recv_topk_idx != _expected_c).any(dim=1).nonzero().squeeze(-1)[:10].tolist()
+                    _p(f'  [fp:mark] topk_idx first 10 mismatch rows: {_ne_c}')
+                    _p(f'  [fp:mark] topk_idx[0:3]={recv_topk_idx[:3].tolist()}')
+                except Exception as _e:
+                    _p(f'  [fp:mark] topk_idx ERROR: {_e}')
 
             def _dbg_diff(a, b, name):
                 if not torch.equal(a, b):

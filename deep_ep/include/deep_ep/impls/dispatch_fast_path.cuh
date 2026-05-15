@@ -477,7 +477,7 @@ dispatch_impl_fast_path(
                                           tma_buffer.get_sf_ptr(), kSFBytesPerToken);
                 }
 
-                // 3. Region C: topk_idx — master writes the full kNumTopk row
+                // 3. Region C: topk_idx — DEBUG: stamp compact_idx*100+k as marker
                 {
                     auto* dst_topk_local = static_cast<topk_idx_t*>(
                         compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
@@ -486,11 +486,7 @@ dispatch_impl_fast_path(
                     if (sym_dst != nullptr) {
                         #pragma unroll
                         for (int k = 0; k < kNumTopk; ++ k) {
-                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
-                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
-                            sym_dst[k] = in_dst
-                                ? static_cast<topk_idx_t>(raw - my_dst_rank * kNumExpertsPerRank)
-                                : static_cast<topk_idx_t>(-1);
+                            sym_dst[k] = static_cast<topk_idx_t>(compact_idx * 100 + k);
                         }
                     }
                 }
