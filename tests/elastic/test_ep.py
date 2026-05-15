@@ -539,27 +539,15 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                 else:
                     _p(f'  [fp:clone] copied_topk_idx OK')
 
-            # DEBUG: fast-path stamped compact_idx as int32 in first 4 bytes of each row.
-            # Verify recv_x[i, 0..1] viewed as int32 equals i.
-            if buffer.rank_idx == 0 and not use_fp8_dispatch:
+            # Compare recv_src_metadata[:,0] (= source token global idx) at first 10 rows.
+            if buffer.rank_idx == 0:
                 try:
-                    _marker = recv_x.contiguous().view(torch.int32)[:, 0]
-                    _expected = torch.arange(_marker.shape[0], device=_marker.device, dtype=torch.int32)
-                    _ne = (_marker != _expected).nonzero().squeeze(-1)[:10].tolist()
-                    _p(f'  [fp:mark] hidden first 10 mismatches: {_ne}; marker[0:10]={_marker[:10].tolist()}')
+                    _fp_src = handle.recv_src_metadata[:10, 0].tolist()
+                    _cd_src = cached_handle.recv_src_metadata[:10, 0].tolist()
+                    _p(f'  [fp:src] handle.recv_src_metadata[:10, 0]={_fp_src}')
+                    _p(f'  [fp:src] cached.recv_src_metadata[:10, 0]={_cd_src}')
                 except Exception as _e:
-                    _p(f'  [fp:mark] hidden ERROR: {_e}')
-
-                # Region C marker: recv_topk_idx[i][k] should equal i*100 + k
-                try:
-                    _N = recv_topk_idx.shape[0]
-                    _expected_c = (torch.arange(_N, device=recv_topk_idx.device, dtype=recv_topk_idx.dtype).unsqueeze(1) * 100
-                                   + torch.arange(8, device=recv_topk_idx.device, dtype=recv_topk_idx.dtype).unsqueeze(0))
-                    _ne_c = (recv_topk_idx != _expected_c).any(dim=1).nonzero().squeeze(-1)[:10].tolist()
-                    _p(f'  [fp:mark] topk_idx first 10 mismatch rows: {_ne_c}')
-                    _p(f'  [fp:mark] topk_idx[0:3]={recv_topk_idx[:3].tolist()}')
-                except Exception as _e:
-                    _p(f'  [fp:mark] topk_idx ERROR: {_e}')
+                    _p(f'  [fp:src] ERROR: {_e}')
 
             def _dbg_diff(a, b, name):
                 if not torch.equal(a, b):

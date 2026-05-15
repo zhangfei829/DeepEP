@@ -458,14 +458,12 @@ dispatch_impl_fast_path(
                 const int compact_idx = s_my_compact_base[my_dst_rank] + my_local_seq_to_dst;
                 EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
 
-                // 1. Region A: hidden — DEBUG mode: skip TMA, write compact_idx marker
-                // as int in first 4 bytes of the row. Host verifies recv_x[i, 0..1] decodes to i.
+                // 1. Region A: hidden (TMA store smem -> peer)
                 {
                     auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
                     auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
-                    if (sym_dst != nullptr) {
-                        *reinterpret_cast<int*>(sym_dst) = compact_idx;
-                    }
+                    if (sym_dst != nullptr)
+                        ptx::tma_store_1d(sym_dst, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
                 }
 
                 // 2. Region B: sf (TMA store smem -> peer, only if sf present)
@@ -477,7 +475,7 @@ dispatch_impl_fast_path(
                                           tma_buffer.get_sf_ptr(), kSFBytesPerToken);
                 }
 
-                // 3. Region C: topk_idx — DEBUG: stamp compact_idx*100+k as marker
+                // 3. Region C: topk_idx — master writes the full kNumTopk row
                 {
                     auto* dst_topk_local = static_cast<topk_idx_t*>(
                         compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
@@ -486,7 +484,11 @@ dispatch_impl_fast_path(
                     if (sym_dst != nullptr) {
                         #pragma unroll
                         for (int k = 0; k < kNumTopk; ++ k) {
-                            sym_dst[k] = static_cast<topk_idx_t>(compact_idx * 100 + k);
+                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
+                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
+                            sym_dst[k] = in_dst
+                                ? static_cast<topk_idx_t>(raw - my_dst_rank * kNumExpertsPerRank)
+                                : static_cast<topk_idx_t>(-1);
                         }
                     }
                 }
