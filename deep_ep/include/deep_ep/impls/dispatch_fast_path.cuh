@@ -389,7 +389,7 @@ dispatch_impl_fast_path(
         float*      my_stage_D = reinterpret_cast<float*>(my_stage_base +
             static_cast<int>(kNumTopk * sizeof(topk_idx_t)));
 
-        // Init mbarrier (legacy pattern)
+        // Init mbarrier (single-buffer pipeline).
         ptx::arrival_phase phase = 0;
         const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
         if (ptx::elect_one_sync())
@@ -402,7 +402,7 @@ dispatch_impl_fast_path(
         for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
 
-            // Wait any previous TMA stores to drain
+            // Wait any previous TMA stores to drain (single buffer reuses smem)
             ptx::tma_store_wait();
             __syncwarp();
 
@@ -470,43 +470,10 @@ dispatch_impl_fast_path(
             }
             __syncwarp();
 
-            // Wait TMA load completion (hidden + sf both arrived)
-            if (ptx::elect_one_sync()) {
-                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-            }
-            __syncwarp();
-
-            // For each unique dst_rank: TMA store smem -> peer compact buffer
-            if (is_master_for_dst) {
-                const int compact_idx = s_my_compact_base[my_dst_rank] + my_local_seq_to_dst;
-                EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
-
-                // 1. Region A: hidden (TMA store smem -> peer)
-                {
-                    auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
-                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
-                    if (sym_dst != nullptr)
-                        ptx::tma_store_1d(sym_dst, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
-                }
-
-                // 2. Region B: sf (TMA store smem -> peer, only if sf present)
-                if constexpr (kNumSFPacks > 0) {
-                    auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(compact_idx));
-                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
-                    if (sym_dst != nullptr)
-                        ptx::tma_store_1d(reinterpret_cast<void*>(sym_dst),
-                                          tma_buffer.get_sf_ptr(), kSFBytesPerToken);
-                }
-
-                ptx::tma_store_commit();
-            }
-            __syncwarp();
-
-            // Stage region C/D in per-warp per-lane smem.  Reuses my_expert_raw
-            // and my_topk_w registers loaded above (NO extra ldg) — broadcast
-            // each lane's raw/w to all warp lanes via __shfl_sync, masters
-            // write their stage slot, non-masters discard.
+            // Stage region C/D in per-warp per-lane smem (parallel with the
+            // TMA hidden load — uses register-only data, doesn't touch
+            // tma_buffer hidden region). Done BEFORE mbarrier wait so it
+            // overlaps with NVLink fetch.
             EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
                              "Region C/D staging assumes kNumTopk=8");
             #pragma unroll
@@ -524,13 +491,38 @@ dispatch_impl_fast_path(
             }
             __syncwarp();
 
-            // ALL master lanes issue their TMA stores in parallel (one TMA per
-            // region per master). Plus a tiny int2 Region E scalar store.
+            // Wait TMA load completion (hidden + sf both arrived in cur slot).
+            if (ptx::elect_one_sync()) {
+                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+            }
+            __syncwarp();
+
+            // Single master block: issue ALL TMA stores (hidden + sf + region
+            // C/D) and the region E scalar in one go, with one tma_store_commit.
+            // Combining the 2 prior commit groups into 1 keeps the
+            // double-buffer pipeline depth math simple: tma_store_wait<1>()
+            // before reusing a slot guarantees its prev-iter store is done.
             if (is_master_for_dst) {
                 const int compact_idx = s_my_compact_base[my_dst_rank] + my_local_seq_to_dst;
                 EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
 
-                // Region C: 64B TMA store smem -> peer compact[compact_idx].topk_idx
+                // Region A: hidden (14336B TMA store smem -> peer)
+                {
+                    auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
+                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
+                    if (sym_dst != nullptr)
+                        ptx::tma_store_1d(sym_dst, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                }
+                // Region B: sf (only if sf present)
+                if constexpr (kNumSFPacks > 0) {
+                    auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(compact_idx));
+                    auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
+                    if (sym_dst != nullptr)
+                        ptx::tma_store_1d(reinterpret_cast<void*>(sym_dst),
+                                          tma_buffer.get_sf_ptr(), kSFBytesPerToken);
+                }
+                // Region C: 64B TMA store from per-lane stage smem
                 {
                     auto* dst_C_local = static_cast<topk_idx_t*>(
                         compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
@@ -541,8 +533,7 @@ dispatch_impl_fast_path(
                                           my_stage_C,
                                           kNumTopk * sizeof(topk_idx_t));
                 }
-
-                // Region D: 32B TMA store smem -> peer compact[compact_idx].topk_weights
+                // Region D: 32B TMA store
                 if (topk_weights != nullptr) {
                     float* sym_D = gin_compact.template get_sym_ptr<team_t>(
                         compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
@@ -552,8 +543,7 @@ dispatch_impl_fast_path(
                                           my_stage_D,
                                           kNumTopk * sizeof(float));
                 }
-
-                // Region E: 8B int2 scalar store of [src_token_global, src_topk_idx]
+                // Region E: 8B int2 scalar store
                 int* sym_E = gin_compact.template get_sym_ptr<team_t>(
                     compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
                     my_dst_rank);
@@ -564,19 +554,16 @@ dispatch_impl_fast_path(
                     *reinterpret_cast<int2*>(sym_E) = v;
                 }
 
-                ptx::tma_store_commit();
+                ptx::tma_store_commit();  // single commit group per token
             }
             __syncwarp();
 
             // No per-master arrival_counter atomic: cross-rank `kDispatchTag1`
             // barrier at the end of this kernel already guarantees all src
-            // dispatch stores are globally visible to every dst once the
-            // barrier releases. Using the cross-rank barrier replaces 16384
-            // per-master NVLink atomics with one cross-rank handshake (~14us).
-            __syncwarp();
+            // dispatch stores are globally visible.
         }
 
-        // Drain remaining TMA stores before final barrier
+        // Drain final stores before phase 3 / final barrier
         ptx::tma_store_wait();
         __syncwarp();
     }
