@@ -140,6 +140,11 @@ dispatch_impl_fast_path(
                       comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
+    // ---- DEBUG: per-phase cycle counters ----
+    uint64_t t_kstart = clock64();
+    uint64_t t_after_notify = 0, t_after_psum_wait = 0,
+             t_after_dispatch = 0, t_after_arrival = 0, t_kend = 0;
+
     // -----------------------------------------------------------------------
     // PHASE 1: NOTIFY — ALL kNumWarps warps participate (kNumThreads total).
     // Identical to legacy NOTIFY, plus the dst->src G broadcast at the end.
@@ -309,10 +314,9 @@ dispatch_impl_fast_path(
 
     // -----------------------------------------------------------------------
     // PHASE 1.5: spin-wait for peer_psum_buf to be populated by every dst.
-    // The spin-wait reads "encoded + 1" values; non-zero means the remote
-    // dst already wrote (psum_val + 1) into this slot.
     // -----------------------------------------------------------------------
     __syncthreads();
+    t_after_notify = clock64();
 
     // Reuse the NOTIFY counter region of dynamic smem (no longer used after
     // phase 1) for the per-block compact_base cache.  Avoids adding any
@@ -338,6 +342,7 @@ dispatch_impl_fast_path(
         s_my_compact_base[thread_idx] = v - 1;
     }
     __syncthreads();
+    t_after_psum_wait = clock64();
 
     // -----------------------------------------------------------------------
     // PHASE 2: ALL kNumWarps warps run the staged TMA dispatch pipeline.
@@ -591,6 +596,8 @@ dispatch_impl_fast_path(
         ptx::tma_store_wait();
         __syncwarp();
     }
+    __syncthreads();
+    t_after_dispatch = clock64();
 
     // -----------------------------------------------------------------------
     // PHASE 3: dst-side wait until arrival counters >= rank_count
@@ -620,6 +627,8 @@ dispatch_impl_fast_path(
             ptx::st_relaxed_sys(counter_ptr, 0);
         }
     }
+    __syncthreads();
+    t_after_arrival = clock64();
 
     // Final cross-SM barrier to ensure all dst arrivals visible before kernel return.
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
@@ -638,6 +647,19 @@ dispatch_impl_fast_path(
     // here so the +1 sentinel is back to 0 for the next call.
     if (sm_idx == 0 and thread_idx < kNumRanks) {
         *compact_layout.peer_psum_ptr(/*dst=*/thread_idx, /*src=*/rank_idx) = 0;
+    }
+    t_kend = clock64();
+
+    // ---- DEBUG: dump phase deltas (only sm0 thread0 of rank 0) ----
+    // sm_103 SM clock ~1.5GHz; 1500 cycles = 1us.
+    if (rank_idx == 0 and sm_idx == 0 and thread_idx == 0) {
+        printf("[fp_phase] notify=%llu psum_wait=%llu dispatch=%llu arrival_wait=%llu final=%llu total=%llu (cycles)\n",
+               (unsigned long long)(t_after_notify  - t_kstart),
+               (unsigned long long)(t_after_psum_wait - t_after_notify),
+               (unsigned long long)(t_after_dispatch - t_after_psum_wait),
+               (unsigned long long)(t_after_arrival - t_after_dispatch),
+               (unsigned long long)(t_kend - t_after_arrival),
+               (unsigned long long)(t_kend - t_kstart));
     }
 }
 
