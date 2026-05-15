@@ -665,6 +665,19 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                         assert torch.equal(ref_t, t), f'{ref_t=}, {t=}'
 
             # Combined data should also be bitwise-identical
+            if buffer.rank_idx == 0:
+                _nan_x = torch.isnan(combined_x.float())
+                _nan_y = torch.isnan(ref_combined_y.float())
+                _p(f'  [fp:cmb] combined_x nan_count={_nan_x.sum().item()} ref_y nan_count={_nan_y.sum().item()}')
+                _row_nan = _nan_x.any(dim=1)
+                _nan_rows = _row_nan.nonzero().flatten()
+                _p(f'  [fp:cmb] combined_x num_nan_rows={_row_nan.sum().item()} first_10={_nan_rows[:10].tolist()}')
+                if _nan_rows.numel() > 0:
+                    _T = _nan_rows[0].item()
+                    _p(f'  [fp:cmb] T={_T} topk_idx[T]={topk_idx[_T].tolist()} topk_w[T]={topk_weights[_T].tolist()}')
+                    _p(f'  [fp:cmb] dst_buf_slot[T]={handle.dst_buffer_slot_idx[_T].tolist()}')
+                    _p(f'  [fp:cmb] combined_x[T,:8]={combined_x[_T,:8].tolist()}')
+                    _p(f'  [fp:cmb] ref_y[T,:8]={ref_combined_y[_T,:8].tolist()}')
             assert torch.equal(combined_x, ref_combined_y), \
                 f'Diff: {calc_diff(combined_x, ref_combined_y)}'
             assert torch.equal(reduced_combined_x, ref_reduced_combined_y), \
