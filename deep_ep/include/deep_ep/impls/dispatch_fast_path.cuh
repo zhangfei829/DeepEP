@@ -452,14 +452,20 @@ dispatch_impl_fast_path(
             }
             __syncwarp();
 
-            // For each unique dst_rank: TMA store smem -> peer compact buffer
+            // For each unique dst_rank: TMA store hidden, then cooperatively write
+            // metadata regions. Master lane (per dst) issues TMA + computes
+            // compact_idx; all 8 lanes 0..7 then write region C/D/E entries in
+            // parallel by shfl-ing the master's `compact_idx` and `my_dst_rank`.
+            // This replaces a serial 7-store master loop (~40 NVLink writes per
+            // master) with one parallel store per region per master.
+            int my_compact_idx = -1;
             if (is_master_for_dst) {
-                const int compact_idx = s_my_compact_base[my_dst_rank] + my_local_seq_to_dst;
-                EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
+                my_compact_idx = s_my_compact_base[my_dst_rank] + my_local_seq_to_dst;
+                EP_DEVICE_ASSERT(my_compact_idx >= 0 and my_compact_idx < kNumMaxTokensPerRank * kNumRanks);
 
                 // 1. Region A: hidden (TMA store smem -> peer)
                 {
-                    auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(compact_idx));
+                    auto* local_dst = compact_layout.hidden_ptr(static_cast<int64_t>(my_compact_idx));
                     auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
                     if (sym_dst != nullptr)
                         ptx::tma_store_1d(sym_dst, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
@@ -467,81 +473,78 @@ dispatch_impl_fast_path(
 
                 // 2. Region B: sf (TMA store smem -> peer, only if sf present)
                 if constexpr (kNumSFPacks > 0) {
-                    auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(compact_idx));
+                    auto* local_dst = compact_layout.sf_ptr(static_cast<int64_t>(my_compact_idx));
                     auto* sym_dst   = gin_compact.template get_sym_ptr<team_t>(local_dst, my_dst_rank);
                     if (sym_dst != nullptr)
                         ptx::tma_store_1d(reinterpret_cast<void*>(sym_dst),
                                           tma_buffer.get_sf_ptr(), kSFBytesPerToken);
                 }
 
-                // 3. Region C: topk_idx — master writes kNumTopk int64 row.
-                // Vectorize as 4x16B int4 stores (kNumTopk=8 -> 4 int4 = 64B) to
-                // reduce NVLink scalar-store pressure vs 8x8B writes.
-                EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
-                                 "Region C int4 packing assumes kNumTopk=8 int64");
-                {
-                    auto* dst_topk_local = static_cast<topk_idx_t*>(
-                        compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
-                    topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(
-                        dst_topk_local, my_dst_rank);
-                    if (sym_dst != nullptr) {
-                        topk_idx_t local_topk[kNumTopk];
-                        #pragma unroll
-                        for (int k = 0; k < kNumTopk; ++ k) {
-                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
-                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
-                            local_topk[k] = in_dst
-                                ? static_cast<topk_idx_t>(raw - my_dst_rank * kNumExpertsPerRank)
-                                : static_cast<topk_idx_t>(-1);
-                        }
-                        auto* dst_v = reinterpret_cast<int4*>(sym_dst);
-                        const auto* src_v = reinterpret_cast<const int4*>(local_topk);
-                        #pragma unroll
-                        for (int v = 0; v < kNumTopk * static_cast<int>(sizeof(topk_idx_t)) / 16; ++ v)
-                            dst_v[v] = src_v[v];
-                    }
-                }
-
-                // 4. Region D: topk_weights — master writes kNumTopk float row.
-                // Vectorize as 2x16B int4 stores (8 floats = 32B = 2 int4).
-                if (topk_weights != nullptr) {
-                    float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
-                        compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
-                        my_dst_rank);
-                    if (sym_dst != nullptr) {
-                        float local_w[kNumTopk];
-                        #pragma unroll
-                        for (int k = 0; k < kNumTopk; ++ k)
-                            local_w[k] = __ldg(topk_weights + token_idx * kNumTopk + k);
-                        auto* dst_v = reinterpret_cast<int4*>(sym_dst);
-                        const auto* src_v = reinterpret_cast<const int4*>(local_w);
-                        #pragma unroll
-                        for (int v = 0; v < kNumTopk * static_cast<int>(sizeof(float)) / 16; ++ v)
-                            dst_v[v] = src_v[v];
-                    }
-                }
-
-                // 5. Region E: src_metadata — master writes only [0]=src_token_global
-                // and [1]=master_src_topk_idx. The remaining (2 + kNumTopk) entries
-                // are only needed for do_expand path which fast-path doesn't support.
-                // Combine + user code only read [0] and [1].
-                {
-                    int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
-                        compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
-                        my_dst_rank);
-                    if (sym_dst != nullptr) {
-                        // Pack [0,1] as one int2 (8B) write.
-                        int2 v;
-                        v.x = rank_idx * kNumMaxTokensPerRank + token_idx;
-                        // master_src_topk_idx is this master's own lane_idx (highest
-                        // lane in its dst's match group, which by definition is itself).
-                        v.y = rank_idx * kNumTopk + lane_idx;
-                        *reinterpret_cast<int2*>(sym_dst) = v;
-                    }
-                }
-
                 ptx::tma_store_commit();
             }
+            __syncwarp();
+
+            // Cooperative metadata writes: iterate each master lane in the warp,
+            // broadcast its (my_dst_rank, compact_idx), and have lanes 0..7 each
+            // write their own k-th entry of region C/D/E in parallel.
+            EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
+                             "Region C cooperative path assumes kNumTopk=8 int64");
+            {
+                unsigned master_mask = ptx::gather(is_master_for_dst);
+                while (master_mask) {
+                    const int m_lane = __ffs(static_cast<int>(master_mask)) - 1;
+                    master_mask &= ~(1u << m_lane);
+                    const int m_dst    = __shfl_sync(0xffffffff, my_dst_rank,        m_lane);
+                    const int m_cidx   = __shfl_sync(0xffffffff, my_compact_idx,    m_lane);
+                    if (m_dst < 0 or m_cidx < 0) continue;
+
+                    // Region C: lane k writes its own entry.
+                    {
+                        auto* dst_topk_local = static_cast<topk_idx_t*>(
+                            compact_layout.topk_idx_ptr(static_cast<int64_t>(m_cidx)));
+                        topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(
+                            dst_topk_local, m_dst);
+                        if (sym_dst != nullptr and lane_idx < kNumTopk) {
+                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
+                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == m_dst);
+                            sym_dst[lane_idx] = in_dst
+                                ? static_cast<topk_idx_t>(raw - m_dst * kNumExpertsPerRank)
+                                : static_cast<topk_idx_t>(-1);
+                        }
+                    }
+
+                    // Region D: lane k writes its own weight.
+                    if (topk_weights != nullptr) {
+                        float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
+                            compact_layout.topk_weights_ptr(static_cast<int64_t>(m_cidx)),
+                            m_dst);
+                        if (sym_dst != nullptr and lane_idx < kNumTopk) {
+                            sym_dst[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+                        }
+                    }
+
+                    // Region E: lane 0 writes [0]=src_token_global, lane 1 writes
+                    // [1]=rank*topk + master_lane (the master is m_lane).
+                    {
+                        int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
+                            compact_layout.src_metadata_ptr(static_cast<int64_t>(m_cidx)),
+                            m_dst);
+                        if (sym_dst != nullptr) {
+                            if (lane_idx == 0)
+                                sym_dst[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
+                            else if (lane_idx == 1)
+                                sym_dst[1] = rank_idx * kNumTopk + m_lane;
+                        }
+                    }
+                }
+            }
+            __syncwarp();
+
+            // Make all the cooperative metadata stores (issued from various lanes
+            // 0..7) visible to remote readers before the per-dst arrival counter
+            // is incremented. red_add_rel_sys only covers the issuing thread's
+            // prior writes; cross-lane writes need a system-scope fence.
+            __threadfence_system();
             __syncwarp();
 
             // Arrival counter on dst (one lane per unique dst)
