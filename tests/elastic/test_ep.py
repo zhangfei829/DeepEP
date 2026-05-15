@@ -72,10 +72,16 @@ def _maybe_print_kernel_warps_metadata(printed: dict):
         args = _extract_template_args(full)
         if not args:
             return None
+        # Fast-path kernel: `dispatch_impl_fast_path<bool, bool, kNumSMs, kNumNotifyWarps,
+        #   kNumDispatchWarps, kNumRanks, ...>` (2 leading bools)
+        # Legacy kernel: `dispatch_impl<bool, bool, bool, kNumSMs, kNumNotifyWarps,
+        #   kNumDispatchWarps, kNumRanks, ...>` (3 leading bools)
+        is_fast = 'fast_path' in full
         try:
-            # `dispatch_impl<bool, bool, bool, kNumSMs, kNumNotifyWarps,
-            #   kNumDispatchWarps, kNumRanks, ...>`
-            num_sms = int(args[3]); n_notify = int(args[4]); n_dispatch = int(args[5])
+            if is_fast:
+                num_sms = int(args[2]); n_notify = int(args[3]); n_dispatch = int(args[4])
+            else:
+                num_sms = int(args[3]); n_notify = int(args[4]); n_dispatch = int(args[5])
         except (IndexError, ValueError):
             return None
         return ('dispatch', num_sms, [('notify', n_notify), ('dispatch', n_dispatch)])
