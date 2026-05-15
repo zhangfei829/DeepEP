@@ -369,6 +369,24 @@ dispatch_impl_fast_path(
             math::advance_ptr<int8_t>(smem, kNumSmemBytesForNotify))
             .get_rank_buffer(dispatch_warp_idx).get_token_buffer(0);
 
+        // Per-warp metadata staging area (Region C + Region D src-side smem, used
+        // as TMA store source so we get one TMA store per region instead of
+        // 4+2 individual int4 NVLink writes per master per token).
+        // Layout: 64B Region C (8 int64) + 32B Region D (8 float) = 96B per warp,
+        // padded to TMA align (32B). Placed AFTER all warps' tma_buffer slots.
+        constexpr int kStageBytesPerWarp =
+            math::constexpr_align<int>(static_cast<int>(kNumTopk * sizeof(topk_idx_t)) +
+                                       static_cast<int>(kNumTopk * sizeof(float)),
+                                       ptx::kNumTMAAlignBytes);
+        const int64_t kStageBaseOffset = static_cast<int64_t>(kNumSmemBytesForNotify) +
+            static_cast<int64_t>(kNumDispatchWarps) *
+                token_layout.template get_num_bytes<true, int64_t>();
+        int8_t* warp_stage_base = math::advance_ptr<int8_t>(smem,
+            kStageBaseOffset + static_cast<int64_t>(dispatch_warp_idx) * kStageBytesPerWarp);
+        topk_idx_t* warp_stage_topk = reinterpret_cast<topk_idx_t*>(warp_stage_base);
+        float* warp_stage_w = reinterpret_cast<float*>(warp_stage_base +
+            static_cast<int>(kNumTopk * sizeof(topk_idx_t)));
+
         // Init mbarrier (legacy pattern)
         ptx::arrival_phase phase = 0;
         const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
@@ -474,75 +492,86 @@ dispatch_impl_fast_path(
                                           tma_buffer.get_sf_ptr(), kSFBytesPerToken);
                 }
 
-                // 3. Region C: topk_idx — master writes kNumTopk int64 row.
-                // Vectorize as 4x16B int4 stores (kNumTopk=8 -> 4 int4 = 64B) to
-                // reduce NVLink scalar-store pressure vs 8x8B writes.
-                EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
-                                 "Region C int4 packing assumes kNumTopk=8 int64");
-                {
-                    auto* dst_topk_local = static_cast<topk_idx_t*>(
-                        compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
-                    topk_idx_t* sym_dst = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(
-                        dst_topk_local, my_dst_rank);
-                    if (sym_dst != nullptr) {
-                        topk_idx_t local_topk[kNumTopk];
-                        #pragma unroll
-                        for (int k = 0; k < kNumTopk; ++ k) {
-                            const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
-                            const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == my_dst_rank);
-                            local_topk[k] = in_dst
-                                ? static_cast<topk_idx_t>(raw - my_dst_rank * kNumExpertsPerRank)
-                                : static_cast<topk_idx_t>(-1);
-                        }
-                        auto* dst_v = reinterpret_cast<int4*>(sym_dst);
-                        const auto* src_v = reinterpret_cast<const int4*>(local_topk);
-                        #pragma unroll
-                        for (int v = 0; v < kNumTopk * static_cast<int>(sizeof(topk_idx_t)) / 16; ++ v)
-                            dst_v[v] = src_v[v];
-                    }
-                }
-
-                // 4. Region D: topk_weights — master writes kNumTopk float row.
-                // Vectorize as 2x16B int4 stores (8 floats = 32B = 2 int4).
-                if (topk_weights != nullptr) {
-                    float* sym_dst = gin_compact.template get_sym_ptr<team_t>(
-                        compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
-                        my_dst_rank);
-                    if (sym_dst != nullptr) {
-                        float local_w[kNumTopk];
-                        #pragma unroll
-                        for (int k = 0; k < kNumTopk; ++ k)
-                            local_w[k] = __ldg(topk_weights + token_idx * kNumTopk + k);
-                        auto* dst_v = reinterpret_cast<int4*>(sym_dst);
-                        const auto* src_v = reinterpret_cast<const int4*>(local_w);
-                        #pragma unroll
-                        for (int v = 0; v < kNumTopk * static_cast<int>(sizeof(float)) / 16; ++ v)
-                            dst_v[v] = src_v[v];
-                    }
-                }
-
-                // 5. Region E: src_metadata — master writes only [0]=src_token_global
-                // and [1]=master_src_topk_idx. The remaining (2 + kNumTopk) entries
-                // are only needed for do_expand path which fast-path doesn't support.
-                // Combine + user code only read [0] and [1].
-                {
-                    int* sym_dst = gin_compact.template get_sym_ptr<team_t>(
-                        compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
-                        my_dst_rank);
-                    if (sym_dst != nullptr) {
-                        // Pack [0,1] as one int2 (8B) write.
-                        int2 v;
-                        v.x = rank_idx * kNumMaxTokensPerRank + token_idx;
-                        // master_src_topk_idx is this master's own lane_idx (highest
-                        // lane in its dst's match group, which by definition is itself).
-                        v.y = rank_idx * kNumTopk + lane_idx;
-                        *reinterpret_cast<int2*>(sym_dst) = v;
-                    }
-                }
-
                 ptx::tma_store_commit();
             }
             __syncwarp();
+
+            // Stage Region C/D into per-warp smem cooperatively (lanes 0..7 each
+            // write their own k-th entry). One smem write per lane vs master's
+            // serial 7-store loop. Region D is identical for every dst (same
+            // topk_weights row), Region C depends on dst (in_dst check), so we
+            // restage Region C per master inside the master loop below.
+            EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
+                             "Region C/D staging assumes kNumTopk=8");
+            if (topk_weights != nullptr and lane_idx < kNumTopk)
+                warp_stage_w[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+            __syncwarp();
+
+            // Per-master TMA stores for region C/D, plus Region E int2 scalar.
+            // master_lane is `lane_idx` inside the `is_master_for_dst` branch.
+            // We iterate masters via ballot so each master's TMA stores are issued
+            // by ITS lane (release ordering on red_add_rel_sys later covers them).
+            unsigned master_mask = ptx::gather(is_master_for_dst);
+            while (master_mask) {
+                const int m_lane = __ffs(static_cast<int>(master_mask)) - 1;
+                master_mask &= ~(1u << m_lane);
+                const int m_dst = __shfl_sync(0xffffffff, my_dst_rank, m_lane);
+                int m_cidx = -1;
+                if (m_dst >= 0) {
+                    const int m_seq = __shfl_sync(0xffffffff, my_local_seq_to_dst, m_lane);
+                    const int m_base = (lane_idx == 0)
+                        ? s_my_compact_base[m_dst] : 0;
+                    const int m_base_b = __shfl_sync(0xffffffff, m_base, 0);
+                    m_cidx = m_base_b + m_seq;
+                }
+                if (m_dst < 0 or m_cidx < 0) continue;
+
+                // Stage Region C in per-warp smem (lanes 0..7 cooperatively).
+                if (lane_idx < kNumTopk) {
+                    const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
+                    const bool in_dst = (raw >= 0) and (raw / kNumExpertsPerRank == m_dst);
+                    warp_stage_topk[lane_idx] = in_dst
+                        ? static_cast<topk_idx_t>(raw - m_dst * kNumExpertsPerRank)
+                        : static_cast<topk_idx_t>(-1);
+                }
+                __syncwarp();
+
+                // Master lane issues TMA stores from smem -> peer dst regions, plus
+                // a small scalar Region E [0,1] int2 store.
+                if (lane_idx == m_lane) {
+                    auto* dst_C_local = static_cast<topk_idx_t*>(
+                        compact_layout.topk_idx_ptr(static_cast<int64_t>(m_cidx)));
+                    topk_idx_t* sym_C = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(
+                        dst_C_local, m_dst);
+                    if (sym_C != nullptr)
+                        ptx::tma_store_1d(reinterpret_cast<void*>(sym_C),
+                                          warp_stage_topk,
+                                          kNumTopk * sizeof(topk_idx_t));
+
+                    if (topk_weights != nullptr) {
+                        float* sym_D = gin_compact.template get_sym_ptr<team_t>(
+                            compact_layout.topk_weights_ptr(static_cast<int64_t>(m_cidx)),
+                            m_dst);
+                        if (sym_D != nullptr)
+                            ptx::tma_store_1d(reinterpret_cast<void*>(sym_D),
+                                              warp_stage_w,
+                                              kNumTopk * sizeof(float));
+                    }
+
+                    int* sym_E = gin_compact.template get_sym_ptr<team_t>(
+                        compact_layout.src_metadata_ptr(static_cast<int64_t>(m_cidx)),
+                        m_dst);
+                    if (sym_E != nullptr) {
+                        int2 v;
+                        v.x = rank_idx * kNumMaxTokensPerRank + token_idx;
+                        v.y = rank_idx * kNumTopk + m_lane;
+                        *reinterpret_cast<int2*>(sym_E) = v;
+                    }
+
+                    ptx::tma_store_commit();
+                }
+                __syncwarp();
+            }
 
             // Arrival counter on dst (one lane per unique dst)
             if (is_master_for_dst) {
