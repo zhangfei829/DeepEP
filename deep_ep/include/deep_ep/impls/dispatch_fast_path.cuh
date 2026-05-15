@@ -147,24 +147,28 @@ dispatch_impl_fast_path(
              t_after_dispatch = 0, t_after_arrival = 0, t_kend = 0;
 
     // -----------------------------------------------------------------------
-    // PHASE 1: NOTIFY — ALL kNumWarps warps participate (kNumThreads total).
-    // Identical to legacy NOTIFY, plus the dst->src G broadcast at the end.
+    // PHASE 1: NOTIFY — only kNumNotifyWarps warps participate (matches legacy).
+    // Using all kNumWarps warps caused atomicAdd_block contention on smem
+    // counters (12 warps × 64 SMs all hammering same cache line).  Restricting
+    // to 4 notify warps and letting the other 8 idle until phase 2 reduced
+    // contention while keeping total per-rank notify work the same.
     // -----------------------------------------------------------------------
-    {
+    constexpr int kNumNotifyThreads = kNumNotifyWarps * 32;
+    if (warp_idx < kNumNotifyWarps) {
         constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
         const auto rank_expert_count = math::advance_ptr<int>(smem, 0);
 
         int *rank_count   = rank_expert_count;
         int *expert_count = rank_expert_count + kNumRanks;
         #pragma unroll
-        for (int i = 0; i < kNumAlignedElems / kNumThreads; ++ i)
-            rank_expert_count[i * kNumThreads + thread_idx] = 0;
-        __syncthreads();
+        for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++ i)
+            rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
+        ptx::named_barrier<kNumNotifyThreads>(1);
 
-        // Atomic add on shared memory (all kNumWarps warps participate)
+        // Atomic add on shared memory (only notify warps participate)
         EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes");
         const auto global_warp_idx_n = warp_idx * kNumSMs + sm_idx;
-        for (int i = global_warp_idx_n; i < num_tokens; i += kNumWarps * kNumSMs) {
+        for (int i = global_warp_idx_n; i < num_tokens; i += kNumNotifyWarps * kNumSMs) {
             const auto dst_expert_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(topk_idx + i * kNumTopk + lane_idx)) : -1;
             if (dst_expert_idx >= 0)
@@ -174,11 +178,11 @@ dispatch_impl_fast_path(
             if (ptx::deduplicate(dst_rank_idx_n, lane_idx) and dst_rank_idx_n >= 0)
                 atomicAdd_block(rank_count + dst_rank_idx_n, 1);
         }
-        __syncthreads();
+        ptx::named_barrier<kNumNotifyThreads>(1);
 
         // Cross-SM reduction (encoded counters)
         #pragma unroll
-        for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumThreads) {
+        for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
             const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
             ptx::red_add(workspace_layout.get_notify_reduction_workspace_ptr() + i, counter);
         }
@@ -186,7 +190,7 @@ dispatch_impl_fast_path(
         if (sm_idx == 0) {
             // Reduce all SM's count and prepare send buffer
             #pragma unroll
-            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumThreads) {
+            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
                 comm::timeout_while<kNumTimeoutCycles>(true, [=](const bool& is_last_check) {
                     const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                     if ((status >> 32) == kNumSMs) {
@@ -206,10 +210,10 @@ dispatch_impl_fast_path(
                     return false;
                 });
             }
-            __syncthreads();
+            ptx::named_barrier<kNumNotifyThreads>(1);
 
             // Cross-rank exchange: rank counts
-            for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+            for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                 const auto dst_rank_counter =
                     workspace_layout.get_scaleup_rank_count_ptr<false>() + rank_idx;
                 gin.put_value<team_t>(dst_rank_counter, static_cast<int64_t>(rank_count[i]), i,
@@ -219,7 +223,7 @@ dispatch_impl_fast_path(
 
             // Cross-rank exchange: expert counts (intra-NVL72 path: per-element NVLink store)
             if constexpr (kIsScaleupNVLink) {
-                for (int i = thread_idx; i < kNumExperts; i += kNumThreads) {
+                for (int i = thread_idx; i < kNumExperts; i += kNumNotifyThreads) {
                     const auto idx = kNumExpertsPerRank * rank_idx + (i % kNumExpertsPerRank);
                     gin.put_value<team_t>(
                         workspace_layout.get_scaleup_expert_count_ptr<false>() + idx,
@@ -228,17 +232,17 @@ dispatch_impl_fast_path(
             } else {
                 // Bulk copy via gin.put for RDMA path; fast-path is intra-NVL72 only,
                 // so this branch is dead but kept for parity.
-                for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+                for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                     const auto src_ptr = workspace_layout.get_scaleup_expert_count_ptr<true>() + kNumExpertsPerRank * i;
                     const auto dst_ptr = workspace_layout.get_scaleup_expert_count_ptr<false>() + kNumExpertsPerRank * rank_idx;
                     gin.put<team_t>(dst_ptr, src_ptr, kNumExpertsPerRank * sizeof(int64_t), i);
                 }
             }
-            __syncthreads();
+            ptx::named_barrier<kNumNotifyThreads>(1);
 
             // Wait for rank and expert counts from peers
             const auto start_clock = clock64();
-            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumThreads) {
+            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                     const auto count = static_cast<int>(
                         ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + i));
@@ -254,10 +258,10 @@ dispatch_impl_fast_path(
                     return false;
                 }, start_clock);
             }
-            __syncthreads();
+            ptx::named_barrier<kNumNotifyThreads>(1);
 
             // Aggregate per-expert sums and update stats counter
-            for (int i = thread_idx; i < kNumExpertsPerRank; i += kNumThreads) {
+            for (int i = thread_idx; i < kNumExpertsPerRank; i += kNumNotifyThreads) {
                 int sum = 0;
                 #pragma unroll
                 for (int j = 0; j < kNumRanks; ++ j)
@@ -266,11 +270,11 @@ dispatch_impl_fast_path(
                 if (cumulative_local_expert_recv_stats != nullptr)
                     atomicAdd(cumulative_local_expert_recv_stats + i, sum);
             }
-            __syncthreads();
+            ptx::named_barrier<kNumNotifyThreads>(1);
 
             // Write host workspace if CPU sync is requested (lets host read N_recv)
             if constexpr (kDoCPUSync) {
-                for (int i = thread_idx; i < kNumRanks + kNumExpertsPerRank; i += kNumThreads) {
+                for (int i = thread_idx; i < kNumRanks + kNumExpertsPerRank; i += kNumNotifyThreads) {
                     host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[i] =
                         math::encode_decode_positive(rank_expert_count[i]);
                 }
@@ -296,11 +300,11 @@ dispatch_impl_fast_path(
             } else if (warp_idx == 1) {
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
-            __syncthreads();
+            ptx::named_barrier<kNumNotifyThreads>(1);
 
             // ===== FAST-PATH-ONLY: dst -> src broadcast of psum_per_scaleup_rank =====
             // (See comment block in earlier revision for the full protocol description.)
-            for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+            for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                 int* dst_psum_slot = compact_layout.peer_psum_ptr(/*dst_rank_idx=*/rank_idx,
                                                                   /*src_rank_idx=*/i);
                 const int psum_val_exclusive = (i == 0) ? 0
