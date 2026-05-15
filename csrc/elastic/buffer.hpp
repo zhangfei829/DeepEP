@@ -29,6 +29,9 @@ class ElasticBuffer {
     // NOTES: for all workspace, we must keep them as zeros
     void *workspace;
     void *host_workspace, *mapped_host_workspace;
+    // Fast-path device-only sender counter (cudaMalloc, NOT NCCL window) for
+    // master-lane atomicAdd in dispatch_impl_fast_path. atomicAdd lands in L2.
+    int *fp_sender_counter = nullptr;
     std::shared_ptr<layout::WorkspaceLayout> workspace_layout_wo_expert;
 
     // CUDA streams
@@ -137,6 +140,17 @@ public:
         CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(&mapped_host_workspace, host_workspace, 0));
         std::memset(host_workspace, 0, layout::WorkspaceLayout::get_num_bytes());
 
+        // Fast-path device-only sender counter array (one int per dst rank).
+        // Used by master lanes to atomic-claim per-(src,dst) slot indices.
+        // Plain cudaMalloc (NOT NCCL window) so atomicAdd lands in L2 cache
+        // (~5ns per atomic) rather than serialising over NVLink fabric.
+        // Replaces the previous workspace_layout.get_scaleup_atomic_sender_counter()
+        // path which used NCCL-window memory and cost ~16384 NVLink atomics
+        // per dispatch call.
+        const int kFpSenderCounterMaxRanks = 64;  // safe upper bound for num_scaleup_ranks
+        CUDA_RUNTIME_CHECK(cudaMalloc(&fp_sender_counter, kFpSenderCounterMaxRanks * sizeof(int)));
+        CUDA_RUNTIME_CHECK(cudaMemset(fp_sender_counter, 0, kFpSenderCounterMaxRanks * sizeof(int)));
+
         // We should call a barrier at the end
         // The barrier should be called by Python `dist.barrier`
         // NOTES: do not call our barrier, as the workspace is not ready yet
@@ -160,6 +174,10 @@ public:
 
         // Deallocate host workspaces
         CUDA_RUNTIME_CHECK(cudaFreeHost(host_workspace));
+        if (fp_sender_counter != nullptr) {
+            CUDA_RUNTIME_CHECK(cudaFree(fp_sender_counter));
+            fp_sender_counter = nullptr;
+        }
 
         // Release fast-path compact window (collective: dereg + free)
         destroy_compact_recv_window();
@@ -1066,6 +1084,7 @@ public:
                                       do_cpu_sync,
                                       compact_mapped_ptr,
                                       compact_window,
+                                      fp_sender_counter,
                                       comm_stream);
         } else {
             launch_dispatch(x.data_ptr(), sf_ptr,

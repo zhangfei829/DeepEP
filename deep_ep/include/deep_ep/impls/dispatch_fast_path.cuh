@@ -71,7 +71,8 @@ dispatch_impl_fast_path(
     const int rank_idx,
     // ----- fast-path additions -----
     void* compact_buffer,            // local LSA pointer to compact_recv_window base
-    const ncclWindow_t compact_window
+    const ncclWindow_t compact_window,
+    int* fp_sender_counter           // device-only [kNumRanks] L2 atomic counter
 ) {
     // -----------------------------------------------------------------------
     // Compile-time constants
@@ -434,21 +435,26 @@ dispatch_impl_fast_path(
                 __syncwarp();
             }
 
-            // Load topk and compute dst_rank per-lane
+            // Load topk + topk_weights once per lane (reused later for staging).
             EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes for top-k");
-            int my_expert_raw = -1;
-            int my_dst_rank   = -1;
+            int   my_expert_raw = -1;
+            int   my_dst_rank   = -1;
+            float my_topk_w     = 0.0f;
             if (lane_idx < kNumTopk) {
                 my_expert_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
                 my_dst_rank   = my_expert_raw >= 0 ? my_expert_raw / kNumExpertsPerRank : -1;
+                if (topk_weights != nullptr)
+                    my_topk_w = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
             }
             const bool is_master_for_dst = ptx::deduplicate(my_dst_rank, lane_idx) and (my_dst_rank >= 0);
 
-            // Allocate src-local seq number for master lane of each unique dst
+            // Allocate src-local seq number per (master, dst) using a
+            // device-only L2 atomic counter (NOT NCCL window) so atomicAdd
+            // does NOT serialise over NVLink fabric. Replaces the legacy
+            // workspace_layout.get_scaleup_atomic_sender_counter() path.
             int my_local_seq_to_dst = -1;
             if (is_master_for_dst) {
-                my_local_seq_to_dst = atomicAdd(
-                    workspace_layout.get_scaleup_atomic_sender_counter() + my_dst_rank, 1);
+                my_local_seq_to_dst = atomicAdd(fp_sender_counter + my_dst_rank, 1);
             }
 
             // Record dst_buffer_slot_idx (so combine() can reverse-route)
@@ -498,42 +504,23 @@ dispatch_impl_fast_path(
             }
             __syncwarp();
 
-            // Cooperatively load topk_idx and topk_weights per lane (1 ldg each).
-            // All 8 master lanes (one per unique dst) then stage region C/D into
-            // their OWN per-lane smem slot in parallel, and finally each master
-            // lane issues its own region C/D TMA stores in parallel.
+            // Stage region C/D in per-warp per-lane smem.  Reuses my_expert_raw
+            // and my_topk_w registers loaded above (NO extra ldg) — broadcast
+            // each lane's raw/w to all warp lanes via __shfl_sync, masters
+            // write their stage slot, non-masters discard.
             EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
                              "Region C/D staging assumes kNumTopk=8");
-            int lane_raw = -1;
-            float lane_w = 0.0f;
-            if (lane_idx < kNumTopk) {
-                lane_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
-                if (topk_weights != nullptr)
-                    lane_w = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
-            }
-
-            // Each master lane stages all 8 entries of region C/D for its own
-            // dst into its own per-lane smem slot.  Reads other lanes' raw/w via
-            // shfl from the cooperatively-loaded registers above (no extra ldg).
-            if (is_master_for_dst) {
-                #pragma unroll
-                for (int k = 0; k < kNumTopk; ++ k) {
-                    const int  raw_k = __shfl_sync(0xffffffff, lane_raw, k);
-                    const float w_k  = __shfl_sync(0xffffffff, lane_w,   k);
+            #pragma unroll
+            for (int k = 0; k < kNumTopk; ++ k) {
+                const int   raw_k = __shfl_sync(0xffffffff, my_expert_raw, k);
+                const float w_k   = __shfl_sync(0xffffffff, my_topk_w,     k);
+                if (is_master_for_dst) {
                     const bool in_dst = (raw_k >= 0) and (raw_k / kNumExpertsPerRank == my_dst_rank);
                     my_stage_C[k] = in_dst
                         ? static_cast<topk_idx_t>(raw_k - my_dst_rank * kNumExpertsPerRank)
                         : static_cast<topk_idx_t>(-1);
                     if (topk_weights != nullptr)
                         my_stage_D[k] = w_k;
-                }
-            } else {
-                // Non-master lanes still have to participate in shfl_sync for
-                // PTX warp-uniform semantics; do so but discard the result.
-                #pragma unroll
-                for (int k = 0; k < kNumTopk; ++ k) {
-                    (void)__shfl_sync(0xffffffff, lane_raw, k);
-                    (void)__shfl_sync(0xffffffff, lane_w,   k);
                 }
             }
             __syncwarp();
@@ -607,11 +594,12 @@ dispatch_impl_fast_path(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
     uint64_t t_after_barrier = clock64();
 
-    // Reset workspace atomic sender counters (one per dst rank) so the next
-    // dispatch() call starts from 0.  Same as legacy dispatch_impl end.
+    // Reset device-only sender counter (one per dst rank) so next dispatch
+    // starts from 0.  This counter is L2-cached cudaMalloc memory, NOT
+    // NCCL-window memory — local stores are cheap.
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
     if (sm_idx == 0 and thread_idx < kNumRanks)
-        workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+        fp_sender_counter[thread_idx] = 0;
 
     // Reset peer_psum_buf slots that THIS rank will spin-wait on next dispatch.
     // As src=my_rank, we read [d][my_rank] for d in [0, kNumRanks); clear them
