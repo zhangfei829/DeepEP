@@ -498,88 +498,11 @@ dispatch_impl_fast_path(
             }
             __syncwarp();
 
-            // Cooperatively load topk_idx and topk_weights per lane (1 ldg each).
-            // All 8 master lanes (one per unique dst) then stage region C/D into
-            // their OWN per-lane smem slot in parallel, and finally each master
-            // lane issues its own region C/D TMA stores in parallel.
-            EP_STATIC_ASSERT(kNumTopk == 8 and sizeof(topk_idx_t) == 8,
-                             "Region C/D staging assumes kNumTopk=8");
-            int lane_raw = -1;
-            float lane_w = 0.0f;
-            if (lane_idx < kNumTopk) {
-                lane_raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
-                if (topk_weights != nullptr)
-                    lane_w = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
-            }
-
-            // Each master lane stages all 8 entries of region C/D for its own
-            // dst into its own per-lane smem slot.  Reads other lanes' raw/w via
-            // shfl from the cooperatively-loaded registers above (no extra ldg).
-            if (is_master_for_dst) {
-                #pragma unroll
-                for (int k = 0; k < kNumTopk; ++ k) {
-                    const int  raw_k = __shfl_sync(0xffffffff, lane_raw, k);
-                    const float w_k  = __shfl_sync(0xffffffff, lane_w,   k);
-                    const bool in_dst = (raw_k >= 0) and (raw_k / kNumExpertsPerRank == my_dst_rank);
-                    my_stage_C[k] = in_dst
-                        ? static_cast<topk_idx_t>(raw_k - my_dst_rank * kNumExpertsPerRank)
-                        : static_cast<topk_idx_t>(-1);
-                    if (topk_weights != nullptr)
-                        my_stage_D[k] = w_k;
-                }
-            } else {
-                // Non-master lanes still have to participate in shfl_sync for
-                // PTX warp-uniform semantics; do so but discard the result.
-                #pragma unroll
-                for (int k = 0; k < kNumTopk; ++ k) {
-                    (void)__shfl_sync(0xffffffff, lane_raw, k);
-                    (void)__shfl_sync(0xffffffff, lane_w,   k);
-                }
-            }
-            __syncwarp();
-
-            // ALL master lanes issue their TMA stores in parallel (one TMA per
-            // region per master). Plus a tiny int2 Region E scalar store.
-            if (is_master_for_dst) {
-                const int compact_idx = s_my_compact_base[my_dst_rank] + my_local_seq_to_dst;
-                EP_DEVICE_ASSERT(compact_idx >= 0 and compact_idx < kNumMaxTokensPerRank * kNumRanks);
-
-                // Region C: 64B TMA store smem -> peer compact[compact_idx].topk_idx
-                {
-                    auto* dst_C_local = static_cast<topk_idx_t*>(
-                        compact_layout.topk_idx_ptr(static_cast<int64_t>(compact_idx)));
-                    topk_idx_t* sym_C = gin_compact.template get_sym_ptr<team_t, topk_idx_t>(
-                        dst_C_local, my_dst_rank);
-                    if (sym_C != nullptr)
-                        ptx::tma_store_1d(reinterpret_cast<void*>(sym_C),
-                                          my_stage_C,
-                                          kNumTopk * sizeof(topk_idx_t));
-                }
-
-                // Region D: 32B TMA store smem -> peer compact[compact_idx].topk_weights
-                if (topk_weights != nullptr) {
-                    float* sym_D = gin_compact.template get_sym_ptr<team_t>(
-                        compact_layout.topk_weights_ptr(static_cast<int64_t>(compact_idx)),
-                        my_dst_rank);
-                    if (sym_D != nullptr)
-                        ptx::tma_store_1d(reinterpret_cast<void*>(sym_D),
-                                          my_stage_D,
-                                          kNumTopk * sizeof(float));
-                }
-
-                // Region E: 8B int2 scalar store of [src_token_global, src_topk_idx]
-                int* sym_E = gin_compact.template get_sym_ptr<team_t>(
-                    compact_layout.src_metadata_ptr(static_cast<int64_t>(compact_idx)),
-                    my_dst_rank);
-                if (sym_E != nullptr) {
-                    int2 v;
-                    v.x = rank_idx * kNumMaxTokensPerRank + token_idx;
-                    v.y = rank_idx * kNumTopk + lane_idx;
-                    *reinterpret_cast<int2*>(sym_E) = v;
-                }
-
-                ptx::tma_store_commit();
-            }
+            // ABLATION: skip region C/D/E NVLink writes to measure how much of
+            // the dispatch-phase time is consumed by the small metadata stores
+            // vs hidden TMA store + atomic. Output recv_topk_idx/weights/meta
+            // will be garbage; run with VALIDATE=0.
+            (void)my_stage_C; (void)my_stage_D;
             __syncwarp();
 
             // Arrival counter on dst (one lane per unique dst)
