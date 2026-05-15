@@ -423,7 +423,6 @@ dispatch_impl_fast_path(
                 my_dst_rank   = my_expert_raw >= 0 ? my_expert_raw / kNumExpertsPerRank : -1;
             }
             const bool is_master_for_dst = ptx::deduplicate(my_dst_rank, lane_idx) and (my_dst_rank >= 0);
-            const int  master_src_topk_idx = ptx::get_master_lane_idx(ptx::gather(is_master_for_dst));
 
             // Allocate src-local seq number for master lane of each unique dst
             int my_local_seq_to_dst = -1;
@@ -512,7 +511,11 @@ dispatch_impl_fast_path(
                         my_dst_rank);
                     if (sym_dst != nullptr) {
                         sym_dst[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
-                        sym_dst[1] = rank_idx * kNumTopk + master_src_topk_idx;
+                        // master_src_topk_idx is this master's own lane_idx (highest lane
+                        // in its dst's match group, which by definition is itself).
+                        // Combine reads this as src_topk_idx to recover (src_rank, k) for
+                        // pushing back the contribution.
+                        sym_dst[1] = rank_idx * kNumTopk + lane_idx;
                         #pragma unroll
                         for (int k = 0; k < kNumTopk; ++ k) {
                             const int raw = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + k));
