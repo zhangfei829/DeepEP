@@ -527,15 +527,17 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             _p(f'  [fp:hdl] cached.dst_buf_slot[0:3]={cached_handle.dst_buffer_slot_idx[0:3].tolist()}')
             _p(f'  [fp:hdl] handle.num_recv={num_recv_tokens} cached.num_recv={cached_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()}')
 
-            # Permutation discovery: for fast-path's recv_x[i], find which row in cached_recv_x matches.
-            # Use the first 8 BF16 columns as a fingerprint.
+            # DEBUG: fast-path stamped compact_idx as int32 in first 4 bytes of each row.
+            # Verify recv_x[i, 0..1] viewed as int32 equals i.
             if buffer.rank_idx == 0 and not use_fp8_dispatch:
-                _fp_finger = recv_x[:, :8]
-                _cd_finger = cached_recv_x[:, :8]
-                _n = recv_x.shape[0]
-                for _i in range(min(10, _n)):
-                    _matches = (_cd_finger == _fp_finger[_i]).all(dim=1).nonzero().squeeze(-1)[:5].tolist()
-                    _p(f'  [fp:perm] fp.row {_i} matches cached rows: {_matches}')
+                try:
+                    _marker = recv_x.contiguous().view(torch.int32)[:, 0]
+                    _expected = torch.arange(_marker.shape[0], device=_marker.device, dtype=torch.int32)
+                    _ne = (_marker != _expected).nonzero().squeeze(-1)[:10].tolist()
+                    _p(f'  [fp:mark] first 10 mismatches (i where marker != i): {_ne}')
+                    _p(f'  [fp:mark] marker[0:10]={_marker[:10].tolist()}')
+                except Exception as _e:
+                    _p(f'  [fp:mark] ERROR: {_e}')
 
             def _dbg_diff(a, b, name):
                 if not torch.equal(a, b):
