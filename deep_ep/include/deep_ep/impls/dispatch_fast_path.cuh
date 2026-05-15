@@ -399,10 +399,13 @@ dispatch_impl_fast_path(
 
         // Dynamic chunked token assignment via device-only L2 atomic counter
         // (`dyn_token_counter` is cudaMalloc, NOT NCCL window — atomicAdd lands
-        // in L2 cache instead of serialising over NVLink fabric). Fast SMs
-        // automatically pick up extra work, smoothing per-SM dispatch_end and
-        // shrinking cross-rank barrier wait by ~10-20us.
-        constexpr int kTokenChunk = 4;
+        // in L2 cache instead of serialising over NVLink fabric). chunk size
+        // chosen large enough that per-warp avg atomic count is < 1 (i.e. most
+        // warps issue 0 or 1 atomic over the whole loop) so L2 atomic
+        // serialisation cost stays sub-us; small enough that fast SMs still
+        // pick up extra work and smooth per-SM dispatch_end.
+        // 4096 tokens / chunk=16 = 256 atomics for 768 warps -> 0.33 avg.
+        constexpr int kTokenChunk = 16;
 
         while (true) {
             int chunk_start;
