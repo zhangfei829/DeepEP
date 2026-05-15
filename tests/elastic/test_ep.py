@@ -271,7 +271,25 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             handle=handle)
         cached_recv_x, cached_recv_topk_idx, cached_recv_topk_weights, cached_handle, cached_dispatch_event = \
             launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, cached_dispatch_args)
-        
+
+        # Freeze fast-path views before bench_kineto reruns rewrite compact_buffer.
+        # In fast-path mode, recv_x / recv_topk_idx / recv_topk_weights / handle.recv_src_metadata
+        # are torch.from_blob views into compact_buffer; subsequent fp dispatches in bench
+        # would otherwise overwrite them with a different atomic ordering and break validation.
+        # cached_handle's recv_* are torch::empty (legacy), already frozen, no clone needed.
+        if not args.skip_check:
+            if use_fp8_dispatch:
+                recv_x = (recv_x[0].detach().clone(), recv_x[1].detach().clone())
+                recv_x_bf16 = per_token_cast_back(recv_x[0], recv_x[1])
+            else:
+                recv_x = recv_x.detach().clone()
+                recv_x_bf16 = recv_x
+            if recv_topk_idx is not None:
+                recv_topk_idx = recv_topk_idx.detach().clone()
+            if recv_topk_weights is not None:
+                recv_topk_weights = recv_topk_weights.detach().clone()
+            handle.recv_src_metadata = handle.recv_src_metadata.detach().clone()
+
         # Count the number of received tokens
         num_recv_tokens = handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
         assert num_recv_tokens == expanded_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item(), \
