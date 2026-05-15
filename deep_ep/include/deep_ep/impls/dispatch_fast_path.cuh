@@ -573,10 +573,15 @@ dispatch_impl_fast_path(
     // PHASE 3 (dst-side arrival_counter spin-wait) removed.
     t_after_arrival = clock64();
 
-    // Final cross-rank barrier
+    // Final cross-rank barrier.
+    // kFlushStores=false: dispatch loop end already drained TMA stores via
+    // ptx::tma_store_wait() at line 567. Repeating the drain inside the
+    // barrier is redundant — saves one tma_store_commit + tma_store_wait +
+    // __syncwarp round trip.
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
-                      comm::kDispatchTag1, true, true, false>(
+                      comm::kDispatchTag1, /*kFlushStores=*/false,
+                      /*kSyncAtStart=*/true, /*kSyncAtEnd=*/false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
     uint64_t t_after_barrier = clock64();
 
