@@ -359,12 +359,9 @@ dispatch_impl_fast_path(
     //   - master writes region E [0,1] as a single int2 (8B) scalar store
     //   - master red_add_rel_sys to peer arrival_counter[my_rank]
     // -----------------------------------------------------------------------
-    if (warp_idx >= kNumNotifyWarps) {
-        // ABLATION: only kNumDispatchWarps (=8) warps run phase 2, the
-        // remaining kNumNotifyWarps idle. This mirrors legacy dispatch_impl's
-        // warp split to test whether 12-warp phase-2 fan-out causes SM/NVLink
-        // resource contention vs legacy's 8-warp dispatch.
-        const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
+    {
+        // Use warp_idx directly as the per-warp slot index.
+        const int dispatch_warp_idx = warp_idx;
 
         // Per-warp tma_buffer in dynamic smem after the notify region.
         // Allocate kNumWarps slots (one per participating warp).
@@ -400,7 +397,7 @@ dispatch_impl_fast_path(
         __syncwarp();
 
         const auto token_start  = dispatch_warp_idx * kNumSMs + sm_idx;
-        const auto token_stride = kNumDispatchWarps * kNumSMs;
+        const auto token_stride = kNumWarps * kNumSMs;
 
         for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
