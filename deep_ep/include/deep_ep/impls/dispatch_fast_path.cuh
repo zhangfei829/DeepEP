@@ -597,17 +597,15 @@ dispatch_impl_fast_path(
     __syncthreads();
     t_after_dispatch = clock64();
 
-    // PHASE 3 (dst-side arrival_counter spin-wait) removed:
-    // the cross-rank `kDispatchTag1` barrier below already serializes "all
-    // ranks finished dispatch + made stores globally visible", which is
-    // strictly cheaper than 16384 per-master NVLink atomics.
+    // PHASE 3 (dst-side arrival_counter spin-wait) removed.
     t_after_arrival = clock64();
 
-    // Final cross-SM barrier to ensure all dst arrivals visible before kernel return.
+    // Final cross-rank barrier
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
                       comm::kDispatchTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    uint64_t t_after_barrier = clock64();
 
     // Reset workspace atomic sender counters (one per dst rank) so the next
     // dispatch() call starts from 0.  Same as legacy dispatch_impl end.
@@ -626,13 +624,21 @@ dispatch_impl_fast_path(
     // ---- DEBUG: dump phase deltas (only sm0 thread0 of rank 0) ----
     // sm_103 SM clock ~1.5GHz; 1500 cycles = 1us.
     if (rank_idx == 0 and sm_idx == 0 and thread_idx == 0) {
-        printf("[fp_phase] notify=%llu psum_wait=%llu dispatch=%llu arrival_wait=%llu final=%llu total=%llu (cycles)\n",
-               (unsigned long long)(t_after_notify  - t_kstart),
+        printf("[fp_phase] notify=%llu psum_wait=%llu dispatch=%llu barrier=%llu reset=%llu total=%llu (cycles)\n",
+               (unsigned long long)(t_after_notify    - t_kstart),
                (unsigned long long)(t_after_psum_wait - t_after_notify),
-               (unsigned long long)(t_after_dispatch - t_after_psum_wait),
-               (unsigned long long)(t_after_arrival - t_after_dispatch),
-               (unsigned long long)(t_kend - t_after_arrival),
-               (unsigned long long)(t_kend - t_kstart));
+               (unsigned long long)(t_after_dispatch  - t_after_psum_wait),
+               (unsigned long long)(t_after_barrier   - t_after_arrival),
+               (unsigned long long)(t_kend            - t_after_barrier),
+               (unsigned long long)(t_kend            - t_kstart));
+    }
+    // Per-SM phase-2 end timing on rank 0: see how much SM 0 is behind/ahead
+    // of other SMs at the moment of finishing dispatch (jitter measurement).
+    if (rank_idx == 0 and thread_idx == 0 and sm_idx < 8) {
+        printf("[fp_phase] sm=%d dispatch_end=%llu barrier_end=%llu (cycles, common origin)\n",
+               sm_idx,
+               (unsigned long long)(t_after_dispatch - t_kstart),
+               (unsigned long long)(t_after_barrier  - t_kstart));
     }
 }
 
