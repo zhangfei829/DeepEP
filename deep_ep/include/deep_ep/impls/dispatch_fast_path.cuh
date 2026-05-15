@@ -582,13 +582,11 @@ dispatch_impl_fast_path(
             }
             __syncwarp();
 
-            // Arrival counter on dst (one lane per unique dst)
-            if (is_master_for_dst) {
-                int* sym_counter = gin_compact.template get_sym_ptr<team_t>(
-                    compact_layout.arrival_counter_ptr(rank_idx), my_dst_rank);
-                if (sym_counter != nullptr)
-                    ptx::red_add_rel_sys(sym_counter, 1);
-            }
+            // No per-master arrival_counter atomic: cross-rank `kDispatchTag1`
+            // barrier at the end of this kernel already guarantees all src
+            // dispatch stores are globally visible to every dst once the
+            // barrier releases. Using the cross-rank barrier replaces 16384
+            // per-master NVLink atomics with one cross-rank handshake (~14us).
             __syncwarp();
         }
 
@@ -599,35 +597,9 @@ dispatch_impl_fast_path(
     __syncthreads();
     t_after_dispatch = clock64();
 
-    // -----------------------------------------------------------------------
-    // PHASE 3: dst-side wait until arrival counters >= rank_count
-    // -----------------------------------------------------------------------
-    // After Phase 2 every src has finished writing; each dst now needs to wait
-    // until its Region F arrival counters cumulatively account for all tokens
-    // each src promised in the NOTIFY phase.
-    if (sm_idx == 0 and warp_idx == 0) {
-        // rank_count[i] was placed into the lower 32-bits of
-        // workspace_layout.get_scaleup_rank_count_ptr<false>()[i] during NOTIFY.
-        // We read it back and wait until our compact arrival counter has reached
-        // that value for every src.
-        for (int src = thread_idx; src < kNumRanks; src += 32) {
-            const auto expected = static_cast<int>(ptx::ld_volatile<int64_t>(
-                workspace_layout.get_scaleup_rank_count_ptr<false>() + src));
-            int* counter_ptr = compact_layout.arrival_counter_ptr(src);
-            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto v = ptx::ld_volatile<int>(counter_ptr);
-                if (v >= expected) return true;
-                if (is_last_check) {
-                    printf("DeepEP[fast] arrival wait timeout rank=%d src=%d got=%d expected=%d\n",
-                           rank_idx, src, v, expected);
-                }
-                return false;
-            });
-            // Reset for next dispatch call.
-            ptx::st_relaxed_sys(counter_ptr, 0);
-        }
-    }
-    __syncthreads();
+    // PHASE 3 (dst-side arrival_counter spin-wait) removed:
+    // The cross-rank `kDispatchTag1` barrier below already serializes "all
+    // ranks finished dispatch + made stores globally visible".
     t_after_arrival = clock64();
 
     // Final cross-SM barrier to ensure all dst arrivals visible before kernel return.
