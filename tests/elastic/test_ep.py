@@ -527,6 +527,18 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             _p(f'  [fp:hdl] cached.dst_buf_slot[0:3]={cached_handle.dst_buffer_slot_idx[0:3].tolist()}')
             _p(f'  [fp:hdl] handle.num_recv={num_recv_tokens} cached.num_recv={cached_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()}')
 
+            # Verify fast-path's copied_topk_idx (= handle.topk_idx) matches original topk_idx.
+            if buffer.rank_idx == 0:
+                _orig = topk_idx
+                _cloned = handle.topk_idx
+                if not torch.equal(_orig, _cloned):
+                    _ne = (_orig != _cloned).any(dim=1).nonzero().squeeze(-1)[:10].tolist()
+                    _p(f'  [fp:clone] copied_topk_idx MISMATCH first 10 rows: {_ne}')
+                    for _r in _ne[:3]:
+                        _p(f'  [fp:clone] orig[{_r}]={_orig[_r].tolist()} cloned[{_r}]={_cloned[_r].tolist()}')
+                else:
+                    _p(f'  [fp:clone] copied_topk_idx OK')
+
             # DEBUG: fast-path stamped compact_idx as int32 in first 4 bytes of each row.
             # Verify recv_x[i, 0..1] viewed as int32 equals i.
             if buffer.rank_idx == 0 and not use_fp8_dispatch:
