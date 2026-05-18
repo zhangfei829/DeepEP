@@ -246,16 +246,12 @@ def print_markdown(runs, summaries, metas):
     print('  单元格    = min / avg / max,跨所有 rank 聚合。')
     print()
 
-    # Column widths chosen so cell + header are equal length -> aligned.
-    # Scale-Out (RDMA) columns are omitted in single-NVL72 sweeps because
-    # they are always 0; parse_deepep_csv.py CSV output still keeps them.
-    # us cells must accommodate 4-digit ms-range values for 8K+ token tests
-    # (e.g. "1126.00 / 1130.06 / 1179.00" = 27 chars).
-    W_SU       = 21   # "486 / 489.5 / 496"
-    W_US       = 28   # "1126.00 / 1130.06 / 1179.00"
-    W_COPY     = 9    #  "4607.8 "
-    W_API_BW   = 21
-    W_API_US   = 28
+    # Markdown table shows AVG only (cleaner). min/max still in csv output.
+    W_SU       = 8    # "688.4"
+    W_US       = 10   # "1130.06"
+    W_COPY     = 9    # "4607.8"
+    W_API_BW   = 8
+    W_API_US   = 10
 
     def hdr(name, w):
         return f' {name:<{w}} '
@@ -328,13 +324,13 @@ def print_markdown(runs, summaries, metas):
                 print(row)
                 continue
 
-            su_cell  = f'{s["su_min"]:>3} / {s["su_avg"]:>5.1f} / {s["su_max"]:>3}'
-            us_cell  = f'{s["us_min"]:>7.2f} / {s["us_avg"]:>7.2f} / {s["us_max"]:>7.2f}'
+            su_cell  = f'{s["su_avg"]:>5.1f}'
+            us_cell  = f'{s["us_avg"]:>7.2f}'
             cp_cell  = f'{s["copy_gbs_avg"]:>6.1f}'
 
             if 'api_us_avg' in s:
-                api_su_cell = f'{s["api_su_min"]:>3} / {s["api_su_avg"]:>5.1f} / {s["api_su_max"]:>3}'
-                api_us_cell = f'{s["api_us_min"]:>7.2f} / {s["api_us_avg"]:>7.2f} / {s["api_us_max"]:>7.2f}'
+                api_su_cell = f'{s["api_su_avg"]:>5.1f}'
+                api_us_cell = f'{s["api_us_avg"]:>7.2f}'
             else:
                 api_su_cell = api_us_cell = '(no data)'
 
