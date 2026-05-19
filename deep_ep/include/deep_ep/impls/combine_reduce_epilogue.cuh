@@ -10,7 +10,6 @@
 namespace deep_ep::elastic {
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
-          bool kDirectStoreOutput,
           int kNumSMs, int kNumWarps,
           // TODO: merge these two variables into one (ensure the whole file does not contain "scaleup")
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -99,37 +98,31 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         using combine_vec_t = typename CombineVecTraits<kHidden * sizeof(nv_bfloat16)>::vec_t;
         constexpr int kHiddenVec = kHidden * sizeof(nv_bfloat16) / sizeof(combine_vec_t);
         constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
-        auto* output_token_ptr = static_cast<combine_vec_t*>(output_buffer.get_token_buffer(token_idx).get_base_ptr());
         combine_reduce<kHiddenVec, kUnrollFactor, kNumTokensInLayout>(
-            lane_idx, topk_slot_idx,
-            kDirectStoreOutput ? output_token_ptr : static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+            lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
             /* Get source base */ [=](const int& slot_idx) {
                 return static_cast<combine_vec_t*>(
                     comm_buffer.get_rank_buffer(slot_idx).get_token_buffer(token_idx).get_base_ptr());
             },
             /* Wait buffer release */ [=]() {
-                if constexpr (not kDirectStoreOutput) {
-                    ptx::tma_store_wait();
-                    __syncwarp();
-                }
+                ptx::tma_store_wait();
+                __syncwarp();
             },
             /* Bias 0 */ bias_0 == nullptr ?
                 nullptr : static_cast<combine_vec_t*>(bias_0_buffer.get_token_buffer(token_idx).get_base_ptr()),
             /* Bias 1 */ bias_1 == nullptr ?
                 nullptr : static_cast<combine_vec_t*>(bias_1_buffer.get_token_buffer(token_idx).get_base_ptr())
         );
-        if constexpr (not kDirectStoreOutput) {
-            ptx::tma_store_fence();
-            __syncwarp();
+        ptx::tma_store_fence();
+        __syncwarp();
 
-            // Issue TMA copy
-            if (ptx::elect_one_sync()) {
-                ptx::tma_store_1d(output_buffer.get_token_buffer(token_idx).get_base_ptr(),
-                                  tma_buffer.get_base_ptr(), kNumHiddenBytes);
-                ptx::tma_store_commit();
-            }
-            __syncwarp();
+        // Issue TMA copy
+        if (ptx::elect_one_sync()) {
+            ptx::tma_store_1d(output_buffer.get_token_buffer(token_idx).get_base_ptr(),
+                              tma_buffer.get_base_ptr(), kNumHiddenBytes);
+            ptx::tma_store_commit();
         }
+        __syncwarp();
 
         // Write top-k weights
         if (combined_topk_weights != nullptr) {
