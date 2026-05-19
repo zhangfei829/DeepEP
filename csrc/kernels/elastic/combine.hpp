@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdlib.h>
+
 #include <nccl.h>
 
 #include <deep_ep/common/compiled.cuh>
@@ -133,6 +135,12 @@ static void* launch_combine(void* x,
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+    const char* combine_double_buffer_env = getenv("DEEPEP_COMBINE_DOUBLE_BUFFER");
+    const bool combine_double_buffer =
+        combine_double_buffer_env != nullptr and combine_double_buffer_env[0] != '\0' and combine_double_buffer_env[0] != '0';
+    if (num_scaleout_ranks == 1 and combine_double_buffer)
+        num_warps = std::min(num_warps, num_smem_bytes / (2 * token_layout.get_num_bytes<true>()));
+    EP_HOST_ASSERT(num_warps > 0 and "Invalid combine shared memory size");
 
     // Decide warps
     int num_scaleup_warps = 0, num_forward_warps = 0;
