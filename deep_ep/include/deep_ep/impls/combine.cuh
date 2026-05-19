@@ -48,11 +48,8 @@ combine_impl(nv_bfloat16* x,
     // Buffer layouts
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
-    constexpr bool kUseTmaDoubleBuffer = (not kUseExpandedLayout) and kNumWarps <= 8;
-    const auto tma_rank_buffer = layout::BufferLayout<true>(
-        token_layout, kNumWarps, kUseTmaDoubleBuffer ? 2 : 1, smem).get_rank_buffer(warp_idx);
-    const auto tma_buffer = tma_rank_buffer.get_token_buffer(0);
-    const auto tma_buffer_alt = tma_rank_buffer.get_token_buffer(kUseTmaDoubleBuffer ? 1 : 0);
+    const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumWarps, 1, smem)
+        .get_rank_buffer(warp_idx).get_token_buffer(0);
     const auto recv_buffer = layout::BufferLayout<false>(
         token_layout, kNumTokensInLayout, kNumMaxTokensPerRank, buffer);
     const auto send_buffer = layout::BufferLayout<false>(
@@ -62,14 +59,9 @@ combine_impl(nv_bfloat16* x,
 
     // Init TMA
     ptx::arrival_phase phase = 0;
-    ptx::arrival_phase phase_alt = 0;
     const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
-    const auto mbarrier_alt_ptr = tma_buffer_alt.get_mbarrier_ptr();
-    if (ptx::elect_one_sync()) {
+    if (ptx::elect_one_sync())
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
-        if constexpr (kUseTmaDoubleBuffer)
-            ptx::mbarrier_init_with_fence(mbarrier_alt_ptr, 1);
-    }
     __syncwarp();
 
     // Expanding mode must not be backward
@@ -137,23 +129,15 @@ combine_impl(nv_bfloat16* x,
             if constexpr (kUseExpandedLayout)
                 token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
-            const bool use_alt_buffer = kUseTmaDoubleBuffer and (i & 1);
-            const auto cur_tma_buffer = use_alt_buffer ? tma_buffer_alt : tma_buffer;
-            const auto cur_mbarrier_ptr = use_alt_buffer ? mbarrier_alt_ptr : mbarrier_ptr;
-
             // Normal combine needs to return top-k weights as well. Stage them
             // into the existing per-warp token buffer so hidden + weights use a
             // single TMA store, instead of a 14KB TMA plus a tiny peer store.
-            if (ptx::elect_one_sync()) {
-                if constexpr (kUseTmaDoubleBuffer)
-                    ptx::tma_store_wait<1>();
-                else
-                    ptx::tma_store_wait();
-            }
+            if (ptx::elect_one_sync())
+                ptx::tma_store_wait();
             __syncwarp();
             if (not kUseExpandedLayout and topk_weights != nullptr and lane_idx < kNumTopk) {
-                cur_tma_buffer.get_topk_idx_ptr()[lane_idx] = 0;
-                cur_tma_buffer.get_topk_weights_ptr()[lane_idx] =
+                tma_buffer.get_topk_idx_ptr()[lane_idx] = 0;
+                tma_buffer.get_topk_weights_ptr()[lane_idx] =
                     __ldg(topk_weights + (i * kNumTopk + lane_idx));
             }
             __syncwarp();
@@ -162,12 +146,9 @@ combine_impl(nv_bfloat16* x,
             if (ptx::elect_one_sync()) {
                 const auto load_ptr =
                     math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
-                ptx::tma_load_1d(cur_tma_buffer.get_base_ptr(), load_ptr, cur_mbarrier_ptr, kNumHiddenBytes);
-                ptx::mbarrier_arrive_and_set_tx(cur_mbarrier_ptr, kNumHiddenBytes);
-                if (use_alt_buffer)
-                    ptx::mbarrier_wait_and_flip_phase(cur_mbarrier_ptr, phase_alt);
-                else
-                    ptx::mbarrier_wait_and_flip_phase(cur_mbarrier_ptr, phase);
+                ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
             }
             if (not kUseExpandedLayout and topk_weights != nullptr)
                 ptx::tma_store_fence();
@@ -176,7 +157,7 @@ combine_impl(nv_bfloat16* x,
             if (ptx::elect_one_sync()) {
                 const int store_num_bytes = (not kUseExpandedLayout and topk_weights != nullptr) ?
                     master_token_buffer.get_num_bytes<false>() : kNumHiddenBytes;
-                ptx::tma_store_1d(master_token_buffer.get_base_ptr(), cur_tma_buffer.get_base_ptr(), store_num_bytes);
+                ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), store_num_bytes);
                 ptx::tma_store_commit();
             }
             __syncwarp();
