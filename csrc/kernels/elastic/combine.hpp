@@ -4,18 +4,41 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/layout.cuh>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
 
+extern "C" char* getenv(const char*);
+
 namespace deep_ep::elastic {
+
+static bool is_combine_overlap_enabled(const int& num_scaleout_ranks,
+                                       const int& num_scaleup_ranks,
+                                       const bool& is_scaleup_nvlink,
+                                       const bool& use_expanded_layout,
+                                       const bool& allow_multiple_reduction,
+                                       const int& num_topk) {
+    const auto env = getenv("DEEPEP_COMBINE_OVERLAP");
+    return env != nullptr and env[0] != '\0' and env[0] != '0' and
+           num_scaleout_ranks == 1 and is_scaleup_nvlink and
+           not use_expanded_layout and allow_multiple_reduction and
+           num_scaleup_ranks > num_topk;
+}
+
+static int64_t get_combine_overlap_ready_bytes(const int& num_max_tokens_per_rank,
+                                               const int& num_tokens_in_layout) {
+    return math::align<int64_t>(
+        static_cast<int64_t>(num_max_tokens_per_rank) * num_tokens_in_layout * sizeof(int),
+        static_cast<int64_t>(ptx::kNumTMAAlignBytes));
+}
 
 class CombineRuntime final : public jit::LaunchRuntime<CombineRuntime> {
 public:
     struct Args {
         // Templated arguments
         bool is_scaleup_nvlink;
-        bool use_expanded_layout, allow_multiple_reduction;
+        bool use_expanded_layout, allow_multiple_reduction, overlap_push_reduce;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
@@ -46,9 +69,10 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "combine";
-            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.is_scaleup_nvlink,
                                     args.use_expanded_layout, args.allow_multiple_reduction,
+                                    args.overlap_push_reduce,
                                     args.launch_args.grid_dim.first,
                                     args.launch_args.num_threads / 32,
                                     args.num_scaleup_ranks * args.num_scaleout_ranks,
@@ -133,6 +157,9 @@ static void* launch_combine(void* x,
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+    const bool overlap_push_reduce = is_combine_overlap_enabled(
+        num_scaleout_ranks, num_scaleup_ranks, is_scaleup_nvlink,
+        use_expanded_layout, allow_multiple_reduction, num_topk);
 
     // Decide warps
     int num_scaleup_warps = 0, num_forward_warps = 0;
@@ -153,6 +180,7 @@ static void* launch_combine(void* x,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
+        .overlap_push_reduce = overlap_push_reduce,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
@@ -196,7 +224,7 @@ class CombineReduceEpilogueRuntime final : public jit::LaunchRuntime<CombineRedu
 public:
     struct Args {
         // Templated arguments
-        bool use_expanded_layout, allow_multiple_reduction;
+        bool use_expanded_layout, allow_multiple_reduction, overlap_push_reduce;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
         int num_max_tokens_per_rank;
@@ -222,9 +250,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
+                           args.overlap_push_reduce,
                            args.launch_args.grid_dim.first,
                            args.launch_args.num_threads / 32,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -257,6 +286,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                                           const bool& overlap_push_reduce,
                                            const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
@@ -268,6 +298,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     const CombineReduceEpilogueRuntime::Args args = {
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
+        .overlap_push_reduce = overlap_push_reduce,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
