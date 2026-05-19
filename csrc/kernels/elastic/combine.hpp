@@ -1,7 +1,5 @@
 #pragma once
 
-#include <stdlib.h>
-
 #include <nccl.h>
 
 #include <deep_ep/common/compiled.cuh>
@@ -11,6 +9,8 @@
 #include "../../jit/launch_runtime.hpp"
 
 namespace deep_ep::elastic {
+
+extern "C" char* getenv(const char*);
 
 class CombineRuntime final : public jit::LaunchRuntime<CombineRuntime> {
 public:
@@ -205,6 +205,7 @@ public:
     struct Args {
         // Templated arguments
         bool use_expanded_layout, allow_multiple_reduction;
+        bool direct_store_output;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
         int num_max_tokens_per_rank;
@@ -230,9 +231,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
+                           args.direct_store_output,
                            args.launch_args.grid_dim.first,
                            args.launch_args.num_threads / 32,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -269,13 +271,17 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
-    const auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
+    const char* direct_store_env = getenv("DEEPEP_COMBINE_EPILOGUE_DIRECT_STORE");
+    const bool direct_store_output =
+        direct_store_env != nullptr and direct_store_env[0] != '\0' and direct_store_env[0] != '0';
+    const auto num_warps = direct_store_output ? 32 : std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
     const auto num_threads = num_warps * 32;
 
     // Generate, build and launch
     const CombineReduceEpilogueRuntime::Args args = {
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
+        .direct_store_output = direct_store_output,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -287,7 +293,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .bias_0 = bias_0, .bias_1 = bias_1,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, direct_store_output ? 0 : num_smem_bytes, 1, false, true)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine_reduce_epilogue", code);
