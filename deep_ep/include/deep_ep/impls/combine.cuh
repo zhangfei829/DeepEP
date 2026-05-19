@@ -129,35 +129,15 @@ combine_impl(nv_bfloat16* x,
             if constexpr (kUseExpandedLayout)
                 token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
-            // Normal combine needs to return top-k weights as well. Stage them
-            // into the existing per-warp token buffer so hidden + weights use a
-            // single TMA store, instead of a 14KB TMA plus a tiny peer store.
-            if (ptx::elect_one_sync())
-                ptx::tma_store_wait();
-            __syncwarp();
-            if (not kUseExpandedLayout and topk_weights != nullptr and lane_idx < kNumTopk) {
-                tma_buffer.get_topk_idx_ptr()[lane_idx] = 0;
-                tma_buffer.get_topk_weights_ptr()[lane_idx] =
-                    __ldg(topk_weights + (i * kNumTopk + lane_idx));
-            }
-            __syncwarp();
-
             // No reduce
             if (ptx::elect_one_sync()) {
                 const auto load_ptr =
                     math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+                ptx::tma_store_wait();
                 ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
                 ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
                 ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-            }
-            if (not kUseExpandedLayout and topk_weights != nullptr)
-                ptx::tma_store_fence();
-            __syncwarp();
-
-            if (ptx::elect_one_sync()) {
-                const int store_num_bytes = (not kUseExpandedLayout and topk_weights != nullptr) ?
-                    master_token_buffer.get_num_bytes<false>() : kNumHiddenBytes;
-                ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), store_num_bytes);
+                ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
                 ptx::tma_store_commit();
             }
             __syncwarp();
@@ -231,6 +211,13 @@ combine_impl(nv_bfloat16* x,
                 }
             }
         }
+
+        // Write topk weights
+        if (not kUseExpandedLayout and topk_weights != nullptr and lane_idx < kNumTopk) {
+            const float value = __ldg(topk_weights + (i * kNumTopk + lane_idx));
+            master_token_buffer.get_topk_weights_ptr()[lane_idx] = value;
+        }
+        __syncwarp();
 
         // Wait send buffer's TMA store and issue RDMA send
         // NOTES: `kDoExpandedSend` mode has already issued
