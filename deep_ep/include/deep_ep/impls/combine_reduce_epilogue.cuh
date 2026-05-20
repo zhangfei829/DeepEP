@@ -45,6 +45,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     const auto comm_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
     const auto comm_buffer = layout::BufferLayout<false>(
         comm_token_layout, kNumTokensInLayout, kNumMaxTokensPerRank, recv_buffer);
+    // Match `combine_impl`: ready region sits right after the recv buffer.
     auto* ready_flags = reinterpret_cast<int*>(comm_buffer.get_buffer_end_ptr());
     if constexpr (kOverlapPushReduce) {
         EP_STATIC_ASSERT(kNumScaleoutRanks == 1, "Combine overlap supports direct combine only");

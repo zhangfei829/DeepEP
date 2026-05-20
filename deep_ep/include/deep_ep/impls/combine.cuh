@@ -53,11 +53,18 @@ combine_impl(nv_bfloat16* x,
         .get_rank_buffer(warp_idx).get_token_buffer(0);
     const auto recv_buffer = layout::BufferLayout<false>(
         token_layout, kNumTokensInLayout, kNumMaxTokensPerRank, buffer);
+    // The host buffer reserves `recv + ready (overlap only) + send` and skips the send region for
+    // NVLink scale-up. Place the ready region right after recv so the device pointer matches the
+    // host allocation regardless of the unused device-side send view below.
+    auto* ready_flags = reinterpret_cast<int*>(recv_buffer.get_buffer_end_ptr());
+    constexpr int64_t kReadyBytes = kOverlapPushReduce
+        ? math::align<int64_t>(static_cast<int64_t>(kNumTokensInLayout) * kNumMaxTokensPerRank * sizeof(int),
+                               static_cast<int64_t>(ptx::kNumTMAAlignBytes))
+        : 0;
     const auto send_buffer = layout::BufferLayout<false>(
         token_layout, kNumRanks,
         kNumMaxTokensPerRank * (kDoExpandedSend ? kNumTopk : 1),
-        recv_buffer.get_buffer_end_ptr());
-    auto* ready_flags = reinterpret_cast<int*>(send_buffer.get_buffer_end_ptr());
+        static_cast<int8_t*>(recv_buffer.get_buffer_end_ptr()) + kReadyBytes);
     if constexpr (kOverlapPushReduce) {
         EP_STATIC_ASSERT(kIsScaleupNVLink, "Combine overlap currently supports NVLink scale-up only");
         EP_STATIC_ASSERT(not kUseExpandedLayout, "Combine overlap does not support expanded layout");
