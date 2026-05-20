@@ -14,7 +14,6 @@ namespace deep_ep::elastic {
 
 template <bool kIsScaleupNVLink,
           bool kUseExpandedLayout, bool kAllowMultipleReduction,
-          bool kOverlapPushReduce,
           int kNumSMs, int kNumWarps,
           int kNumRanks,
           int kHidden,
@@ -57,12 +56,6 @@ combine_impl(nv_bfloat16* x,
         token_layout, kNumRanks,
         kNumMaxTokensPerRank * (kDoExpandedSend ? kNumTopk : 1),
         recv_buffer.get_buffer_end_ptr());
-    auto* ready_flags = reinterpret_cast<int*>(send_buffer.get_buffer_end_ptr());
-    if constexpr (kOverlapPushReduce) {
-        EP_STATIC_ASSERT(kIsScaleupNVLink, "Combine overlap currently supports NVLink scale-up only");
-        EP_STATIC_ASSERT(not kUseExpandedLayout, "Combine overlap does not support expanded layout");
-        EP_STATIC_ASSERT(not kUseRankLayout, "Combine overlap currently requires top-k slot layout");
-    }
 
     // Init TMA
     ptx::arrival_phase phase = 0;
@@ -82,16 +75,9 @@ combine_impl(nv_bfloat16* x,
 
     // Full barrier to ensure the remote buffer is available
     const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
-    if constexpr (kOverlapPushReduce) {
-        const int num_ready_flags = kNumTokensInLayout * kNumMaxTokensPerRank;
-        for (int i = sm_idx * kNumThreads + thread_idx; i < num_ready_flags; i += kNumSMs * kNumThreads)
-            ptx::st_release_sys(ready_flags + i, 0);
-    }
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
-    if constexpr (kOverlapPushReduce)
-        cudaTriggerProgrammaticLaunchCompletion();
 
     // Do TMA writes into the remote buffers
     int num_tokens_per_warp = math::ceil_div(num_reduced_tokens, kNumSMs * kNumWarps);
@@ -232,20 +218,6 @@ combine_impl(nv_bfloat16* x,
             master_token_buffer.get_topk_weights_ptr()[lane_idx] = value;
         }
         __syncwarp();
-
-        if constexpr (kOverlapPushReduce) {
-            if (nvlink_bypass and not kDoExpandedSend) {
-                if (ptx::elect_one_sync()) {
-                    ptx::tma_store_wait();
-                    ptx::fence_acq_rel_sys();
-                    auto* local_ready_ptr = ready_flags + src_topk_idx * kNumMaxTokensPerRank + src_token_idx;
-                    auto* peer_ready_ptr = gin.get_sym_ptr<team_t>(local_ready_ptr, src_rank_idx);
-                    if (peer_ready_ptr != nullptr)
-                        ptx::st_release_sys(peer_ready_ptr, 1);
-                }
-                __syncwarp();
-            }
-        }
 
         // Wait send buffer's TMA store and issue RDMA send
         // NOTES: `kDoExpandedSend` mode has already issued

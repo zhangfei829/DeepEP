@@ -1,7 +1,6 @@
 #pragma once
 
 #include <deep_ep/common/compiled.cuh>
-#include <deep_ep/common/comm.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/common/layout.cuh>
 
@@ -11,7 +10,6 @@
 namespace deep_ep::elastic {
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
-          bool kOverlapPushReduce,
           int kNumSMs, int kNumWarps,
           // TODO: merge these two variables into one (ensure the whole file does not contain "scaleup")
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -45,12 +43,6 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     const auto comm_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
     const auto comm_buffer = layout::BufferLayout<false>(
         comm_token_layout, kNumTokensInLayout, kNumMaxTokensPerRank, recv_buffer);
-    auto* ready_flags = reinterpret_cast<int*>(comm_buffer.get_buffer_end_ptr());
-    if constexpr (kOverlapPushReduce) {
-        EP_STATIC_ASSERT(kNumScaleoutRanks == 1, "Combine overlap supports direct combine only");
-        EP_STATIC_ASSERT(not kUseExpandedLayout, "Combine overlap does not support expanded layout");
-        EP_STATIC_ASSERT(not kUseRankLayout, "Combine overlap currently requires top-k slot layout");
-    }
 
     // Store buffers
     const auto output_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, 0, false);
@@ -101,27 +93,6 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                 return kUseRankLayout ? ptx::exchange(stored_dst_rank_idx, idx) : idx;
             }
         );
-
-        if constexpr (kOverlapPushReduce) {
-            #pragma unroll
-            for (int k = 0; k < kNumTokensInLayout; ++ k) {
-                const int slot_idx = topk_slot_idx[k];
-                if (slot_idx >= 0) {
-                    const auto ready_ptr = ready_flags + slot_idx * kNumMaxTokensPerRank + token_idx;
-                    comm::timeout_while<comm::kNumOneSecCycles>([=](const bool& is_last_check) {
-                        const int ready = ptx::ld_acquire_sys<int>(ready_ptr);
-                        if (ready == 1)
-                            return true;
-                        if (is_last_check and lane_idx == 0) {
-                            printf("Combine overlap ready timeout: token=%d slot=%d ready=%d scaleout=%d scaleup=%d\n",
-                                   token_idx, slot_idx, ready, scaleout_rank_idx, scaleup_rank_idx);
-                        }
-                        return false;
-                    });
-                }
-            }
-            __syncwarp();
-        }
 
         // Iterate over per-hidden-chunk stage
         using combine_vec_t = typename CombineVecTraits<kHidden * sizeof(nv_bfloat16)>::vec_t;
