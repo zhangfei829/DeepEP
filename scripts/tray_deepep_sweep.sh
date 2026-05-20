@@ -40,6 +40,10 @@ export DEEPEP_DISABLE_TORCH_COMPILE
 # Fast-path dispatch (non-expand + intra-NVL72). 0 = legacy, 1 = compact RECV BUFFER.
 : "${DEEPEP_FAST_PATH:=0}"
 export DEEPEP_FAST_PATH
+# Combine push/reduce overlap experiment (direct NVLink scale-up only).
+# 0 = default combine, 1 = split-SM ready-flag overlap path.
+: "${DEEPEP_COMBINE_OVERLAP:=0}"
+export DEEPEP_COMBINE_OVERLAP
 
 : "${TRAYS:=pod4-gb300-2-tray01-f3 pod4-gb300-2-tray02-f3 pod4-gb300-2-tray03-f3 pod4-gb300-2-tray04-f3}"
 : "${DEEPEP_DIR:=/home/fizhang/DeepEP}"
@@ -281,6 +285,7 @@ run_one() {
     -x PYTHONPATH -x EP_NCCL_ROOT_DIR \
     -x DEEPEP_DISABLE_TORCH_COMPILE \
     -x DEEPEP_FAST_PATH \
+    -x DEEPEP_COMBINE_OVERLAP \
     -x NCCL_DEBUG -x EP_BUFFER_DEBUG \
     -x MASTER_ADDR="$MASTER_ADDR" -x MASTER_PORT="$MASTER_PORT" \
     -x DEEPEP_LOG_DIR="$DEEPEP_LOG_DIR" -x DEEPEP_RUN_TAG="$tag" \
