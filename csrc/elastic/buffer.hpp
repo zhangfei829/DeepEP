@@ -699,7 +699,8 @@ public:
     static int64_t get_combine_buffer_size(const int& num_max_tokens_per_rank, const int& hidden, const int& num_topk,
                                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                            const bool& is_scaleup_nvlink,
-                                           const bool& allow_multiple_reduction) {
+                                           const bool& allow_multiple_reduction,
+                                           const bool& overlap_push_reduce = false) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
         const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
 
@@ -713,7 +714,9 @@ public:
                 num_max_tokens_per_rank * (allow_multiple_reduction ? 1 : num_topk));
             const auto recv_buffer_layout = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_layout, num_max_tokens_per_rank);
-            return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            const auto ready_bytes = overlap_push_reduce
+                ? get_combine_overlap_ready_bytes(num_max_tokens_per_rank, num_tokens_in_layout) : 0;
+            return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes() + ready_bytes;
         } else {
             // Hybrid combine
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
@@ -762,7 +765,9 @@ public:
         const auto num_combine_bytes = get_combine_buffer_size(
             num_max_tokens_per_rank, hidden, num_topk,
             num_scaleout_ranks, num_scaleup_ranks,
-            is_scaleup_nvlink, allow_multiple_reduction);
+            is_scaleup_nvlink, allow_multiple_reduction,
+            is_combine_overlap_enabled(num_scaleout_ranks, num_scaleup_ranks, is_scaleup_nvlink,
+                                       /* use_expanded_layout */ false, allow_multiple_reduction, num_topk));
 
         // Return the maximum of those layouts
         return std::max(num_dispatch_bytes, num_combine_bytes);
@@ -1433,9 +1438,14 @@ public:
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
 
         // Check buffer size
+        const bool overlap_push_reduce = is_combine_overlap_enabled(
+            nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+            nccl_context->is_scaleup_nvlink, use_expanded_layout,
+            allow_multiple_reduction, num_topk);
         EP_HOST_ASSERT(get_combine_buffer_size(num_max_tokens_per_rank, hidden, num_topk,
                                                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                                               nccl_context->is_scaleup_nvlink, allow_multiple_reduction) <= num_buffer_bytes);
+                                               nccl_context->is_scaleup_nvlink, allow_multiple_reduction,
+                                               overlap_push_reduce) <= num_buffer_bytes);
 
         // Optional configs and metadata for hybrid combine
         int num_channels = 1;
@@ -1508,6 +1518,7 @@ public:
                                        jit::device_runtime->get_num_sms(),
                                        jit::device_runtime->get_num_smem_bytes(),
                                        use_expanded_layout, allow_multiple_reduction,
+                                       overlap_push_reduce,
                                        comm_stream);
 
         // Stream control
