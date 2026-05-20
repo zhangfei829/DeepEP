@@ -171,10 +171,6 @@ static void* launch_combine(void* x,
     const bool overlap_push_reduce = is_combine_overlap_enabled(
         num_scaleout_ranks, num_scaleup_ranks, is_scaleup_nvlink,
         use_expanded_layout, allow_multiple_reduction, num_topk);
-    // A cooperative producer that occupies all SMs leaves no room for the PDL
-    // epilogue to run early. Reserve part of the device for the reduce epilogue
-    // when overlap is enabled so push and reduce can actually execute together.
-    const int combine_num_sms = overlap_push_reduce ? std::max(1, num_sms * 3 / 4) : num_sms;
 
     // Decide warps
     int num_scaleup_warps = 0, num_forward_warps = 0;
@@ -214,7 +210,7 @@ static void* launch_combine(void* x,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
-        .launch_args = jit::LaunchArgs(combine_num_sms, num_threads, num_smem_bytes, 2 - (combine_num_sms % 2), true)
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };
     const auto code = CombineRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine", code);
