@@ -57,9 +57,10 @@ combine_impl(nv_bfloat16* x,
     // NVLink scale-up. Place the ready region right after recv so the device pointer matches the
     // host allocation regardless of the unused device-side send view below.
     auto* ready_flags = reinterpret_cast<int*>(recv_buffer.get_buffer_end_ptr());
+    constexpr int64_t kReadyAlign = static_cast<int64_t>(ptx::kNumTMAAlignBytes);
     constexpr int64_t kReadyBytes = kOverlapPushReduce
-        ? math::align<int64_t>(static_cast<int64_t>(kNumTokensInLayout) * kNumMaxTokensPerRank * sizeof(int),
-                               static_cast<int64_t>(ptx::kNumTMAAlignBytes))
+        ? ((static_cast<int64_t>(kNumTokensInLayout) * static_cast<int64_t>(kNumMaxTokensPerRank) * 4
+            + kReadyAlign - 1) / kReadyAlign) * kReadyAlign
         : 0;
     const auto send_buffer = layout::BufferLayout<false>(
         token_layout, kNumRanks,
