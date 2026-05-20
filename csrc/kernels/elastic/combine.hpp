@@ -26,6 +26,17 @@ static bool is_combine_overlap_enabled(const int& num_scaleout_ranks,
            num_scaleup_ranks > num_topk;
 }
 
+static bool is_combine_direct_slots_enabled(const int& num_scaleout_ranks,
+                                            const int& num_scaleup_ranks,
+                                            const bool& use_expanded_layout,
+                                            const bool& allow_multiple_reduction,
+                                            const int& num_topk) {
+    const auto env = getenv("DEEPEP_COMBINE_DIRECT_SLOTS");
+    return env != nullptr and env[0] != '\0' and env[0] != '0' and
+           num_scaleout_ranks == 1 and not use_expanded_layout and
+           allow_multiple_reduction and num_scaleup_ranks > num_topk;
+}
+
 static int64_t get_combine_overlap_ready_bytes(const int& num_max_tokens_per_rank,
                                                const int& num_tokens_in_layout) {
     return math::align<int64_t>(
@@ -38,7 +49,7 @@ public:
     struct Args {
         // Templated arguments
         bool is_scaleup_nvlink;
-        bool use_expanded_layout, allow_multiple_reduction, overlap_push_reduce;
+        bool use_expanded_layout, allow_multiple_reduction, overlap_push_reduce, direct_slots;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
@@ -250,10 +261,11 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
                            args.overlap_push_reduce,
+                           args.direct_slots,
                            args.launch_args.grid_dim.first,
                            args.launch_args.num_threads / 32,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -292,6 +304,9 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     // Too many warps may cause performance degrade, so we limit into 1024
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
     const auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
+    const bool direct_slots = is_combine_direct_slots_enabled(
+        num_scaleout_ranks, num_scaleup_ranks, use_expanded_layout,
+        allow_multiple_reduction, num_topk);
     const auto num_threads = num_warps * 32;
 
     // Generate, build and launch
@@ -299,6 +314,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
         .overlap_push_reduce = overlap_push_reduce,
+        .direct_slots = direct_slots,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,

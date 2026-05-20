@@ -11,7 +11,7 @@
 namespace deep_ep::elastic {
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
-          bool kOverlapPushReduce,
+          bool kOverlapPushReduce, bool kDirectSlots,
           int kNumSMs, int kNumWarps,
           // TODO: merge these two variables into one (ensure the whole file does not contain "scaleup")
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -91,16 +91,25 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                 return {true, stored_dst_rank_idx};
             }
         }();
-        auto reduce_valid_mask = should_deduplicate ?
-            ptx::gather(ptx::deduplicate(deduplicate_key, lane_idx) and stored_dst_rank_idx >= 0) :
-            ptx::gather(stored_dst_rank_idx >= 0);
         int topk_slot_idx[kNumTokensInLayout];
-        compute_topk_slots(
-            topk_slot_idx, reduce_valid_mask,
-            [=](const int& idx) {
-                return kUseRankLayout ? ptx::exchange(stored_dst_rank_idx, idx) : idx;
-            }
-        );
+        if constexpr (kDirectSlots) {
+            EP_STATIC_ASSERT(not kUseRankLayout, "Direct slot plan expects top-k slot layout");
+            const int selected_slot =
+                (ptx::deduplicate(deduplicate_key, lane_idx) and stored_dst_rank_idx >= 0) ? lane_idx : -1;
+            #pragma unroll
+            for (int k = 0; k < kNumTokensInLayout; ++ k)
+                topk_slot_idx[k] = __shfl_sync(0xffffffff, selected_slot, k);
+        } else {
+            auto reduce_valid_mask = should_deduplicate ?
+                ptx::gather(ptx::deduplicate(deduplicate_key, lane_idx) and stored_dst_rank_idx >= 0) :
+                ptx::gather(stored_dst_rank_idx >= 0);
+            compute_topk_slots(
+                topk_slot_idx, reduce_valid_mask,
+                [=](const int& idx) {
+                    return kUseRankLayout ? ptx::exchange(stored_dst_rank_idx, idx) : idx;
+                }
+            );
+        }
 
         if constexpr (kOverlapPushReduce) {
             #pragma unroll
