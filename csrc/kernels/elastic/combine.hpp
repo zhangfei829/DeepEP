@@ -235,7 +235,7 @@ class CombineReduceEpilogueRuntime final : public jit::LaunchRuntime<CombineRedu
 public:
     struct Args {
         // Templated arguments
-        bool use_expanded_layout, allow_multiple_reduction, overlap_push_reduce;
+        bool use_expanded_layout, allow_multiple_reduction, overlap_push_reduce, direct_slots;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
         int num_max_tokens_per_rank;
