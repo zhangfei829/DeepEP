@@ -114,6 +114,78 @@ Direct store does not materially improve combine. The epilogue is not dominated 
 
 Status: reverted.
 
+## Attempt 4: push/reduce overlap with ready flags
+
+Commits:
+
+- `b12d932 combine: gate push-reduce overlap experiment`
+- `8a26d64 combine: reserve SMs for overlap experiment`
+
+Change:
+
+- Add `DEEPEP_COMBINE_OVERLAP=1`.
+- Add a per-slot ready flag region after the direct combine recv/send buffers.
+- `combine_impl` clears ready flags, triggers the PDL epilogue early, and publishes `ready(slot, token)=1` with release semantics after each NVLink slot push.
+- `combine_reduce_epilogue` keeps `cudaGridDependencySynchronize()`, then waits per required slot with acquire loads before reduce.
+- Later reserve producer SMs (`64 -> 48`) to leave SMs for the PDL epilogue, because an all-SM cooperative producer leaves no room for true overlap.
+
+Result:
+
+| tokens | baseline | attempt | change |
+|---:|---:|---:|---:|
+| 16 | 8.9 | 8.4 | -5.6% |
+| 256 | 208.6 | 202.5 | -2.9% |
+| 512 | 305.8 | 310.9 | +1.7% |
+| 4096 | 561.4 | 560.8 | -0.1% |
+| 8192 | 584.4 | 584.4 | +0.0% |
+
+With reserved producer SMs, single-point tests showed occasional mid-token gains but no stable large-token benefit:
+
+| config | tokens | attempt | change |
+|---|---:|---:|---:|
+| reserved SMs, single run | 512 | 319.9 | +4.6% |
+| reserved SMs | 4096 | 562.6 | +0.2% |
+
+SM sweep for EP16/tokens=512 with overlap enabled:
+
+| num_sms | attempt | change |
+|---:|---:|---:|
+| 40 | 311.1 | +1.7% |
+| 48 | 302.1 | -1.2% |
+| 56 | 304.8 | -0.3% |
+| 64 | 303.3 | -0.8% |
+
+Conclusion:
+
+Ready-flag overlap does not produce stable improvement. Without reserving SMs, the PDL epilogue cannot materially overlap because the cooperative producer occupies the device. Reserving SMs allows some overlap, but it slows the producer enough to cancel the reduce overlap on large tokens. Mid-token gains are within run-to-run jitter and do not justify keeping the code.
+
+Status: reverted.
+
+## Attempt 5: direct slot plan in reduce epilogue
+
+Commits:
+
+- `9d5682d combine: gate direct slot plan experiment`
+- `de1ac76 combine: fix direct slot epilogue args`
+
+Change:
+
+- Add `DEEPEP_COMBINE_DIRECT_SLOTS=1`.
+- Bypass the compact top-k slot list construction in `combine_reduce_epilogue`.
+- Replace per-token `gather`/`compute_topk_slots` compaction with direct lane-shuffled slot selection for the direct scale-up, top-k slot layout.
+
+Result:
+
+| tokens | baseline | attempt | change |
+|---:|---:|---:|---:|
+| 512 | 305.8 | 314.4 | +2.8% |
+
+Conclusion:
+
+Not stable. The combine kernel bandwidth stayed around the same `~564 GB/s` level, indicating that slot-list construction is not the primary bottleneck. The observed API gain is within the same jitter range seen in other single-point tests.
+
+Status: reverted.
+
 ## Why combine is harder than dispatch
 
 Dispatch fast-path can remove a pure copy/unpack epilogue by changing destination layout.
@@ -134,4 +206,4 @@ None of the tested combine micro-optimizations should be kept as default. The la
 - reduce epilogue memory reads and accumulation,
 - shared-memory capacity limiting double buffering.
 
-Further combine work needs a more structural change than small TMA/store rearrangements. Do not repeat these three experiments unless the kernel structure or hardware constraints change.
+Further exact combine work needs a more structural change than small TMA/store rearrangements, ready-flag overlap, or slot-list rewrites. Do not repeat these experiments unless the kernel structure or hardware constraints change.
